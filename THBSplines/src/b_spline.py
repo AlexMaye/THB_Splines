@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 import numpy as np
-
+# One could use scipy's Bspline instead
 
 class BSpline(object):
 
@@ -64,7 +64,7 @@ class UnivariateBSpline(object):
         """
 
         i = self.knot_index(x)
-        if i == -1:
+        if i == -1: # x is outside the domain
             return 0
         t = self._augmented_knots
         i = i + self.degree + 1
@@ -122,7 +122,6 @@ def find_knot_index(x, knots, endpoint=False):
     """
     # if we have requested end point, and are at the end, return
     # corresponding index.
-    knots = knots
     if endpoint and (knots[-2] <= x <= knots[-1]):
         i = max(np.argmax(knots < x) - 1, 0)
         return len(knots) - i - 2
