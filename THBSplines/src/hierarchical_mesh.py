@@ -32,8 +32,8 @@ class HierarchicalMesh(Mesh):
     def __init__(self, knots, dim):
         self.meshes = [CartesianMesh(knots, dim)]
         self.nlevels = 1
-        self.aelem_level = {0: np.array((range(self.meshes[0].nelems)), dtype=np.int)}  # active elements on level
-        self.delem_level = {0: np.array([], dtype=np.int)}  # deactivated elements on level
+        self.aelem_level = {0: np.array((range(self.meshes[0].nelems)), dtype=int)}  # active elements on level
+        self.delem_level = {0: np.array([], dtype=int)}  # deactivated elements on level
         self.nel_per_level = {0: self.meshes[0].nelems}
         self.nel = self.meshes[0].nelems
         self.cell_area_per_level = {0: self.meshes[0].cell_area}
@@ -45,8 +45,8 @@ class HierarchicalMesh(Mesh):
         self.nlevels += 1
         self.meshes.append(self.meshes[-1].refine())
 
-        self.aelem_level[self.nlevels - 1] = (np.array([], dtype=np.int))
-        self.delem_level[self.nlevels - 1] = (np.array([], dtype=np.int))
+        self.aelem_level[self.nlevels - 1] = (np.array([], dtype=int))
+        self.delem_level[self.nlevels - 1] = (np.array([], dtype=int))
         self.cell_area_per_level[self.nlevels - 1] = self.meshes[-1].cell_area
 
 
@@ -80,14 +80,13 @@ class HierarchicalMesh(Mesh):
 
         for level in range(number_of_levels):
             if level in marked_cells:
-                i = np.flatnonzero(np.in1d(marked_cells[level], self.aelem_level[level]))
+                i = np.flatnonzero(np.isin(marked_cells[level], self.aelem_level[level]))
                 marked_active_elements = np.take(marked_cells[level], i)
-                self.aelem_level[level] = np.setdiff1d(self.aelem_level[level], marked_active_elements).astype(np.int)
-                self.delem_level[level] = np.union1d(self.delem_level[level], marked_cells[level]).astype(np.int)
+                self.aelem_level[level] = np.setdiff1d(self.aelem_level[level], marked_active_elements).astype(int)
+                self.delem_level[level] = np.union1d(self.delem_level[level], marked_cells[level]).astype(int)
 
                 new_cells[level + 1] = self.get_children(level, marked_cells[level])
-                self.aelem_level[level + 1] = np.union1d(self.aelem_level[level + 1], new_cells[level + 1]).astype(
-                    np.int)
+                self.aelem_level[level + 1] = np.union1d(self.aelem_level[level + 1], new_cells[level + 1]).astype(int)
 
         self.nel_per_level = {level: len(self.aelem_level[level]) if level in self.aelem_level else 0 for level in
                               range(self.nlevels)}
@@ -104,7 +103,7 @@ class HierarchicalMesh(Mesh):
             i = np.flatnonzero(np.all((cell[:, 0] <= fine_cells[:, :, 0] + eps) & (eps + cell[:, 1] >= fine_cells[:, :, 1]),
                                       axis=1))
             children = np.union1d(children, i)
-        return children.astype(np.int)
+        return children.astype(int)
 
 
 if __name__ == '__main__':

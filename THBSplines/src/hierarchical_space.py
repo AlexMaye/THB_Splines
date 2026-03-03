@@ -55,7 +55,7 @@ class HierarchicalSpace(Space):
 
     def add_level(self):
         """
-        Adds a level of refinement to the hierarchical space.
+        Adds a level l of refinement to the hierarchical space, update active and inactive functions on previous level (l-1)
         """
         if len(self.spaces) == self.mesh.nlevels - 1:
             refined_space, projector_onedim = self.spaces[self.mesh.nlevels - 2].refine()
