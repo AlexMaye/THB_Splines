@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
     name='THBSplines',
-    version='',
+    version='0.1',
     packages=['THBSplines', 'THBSplines.src', 'THBSplines.src_c'],
     url='',
     license='',
