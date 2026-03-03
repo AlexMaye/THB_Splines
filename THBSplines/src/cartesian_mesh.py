@@ -4,6 +4,30 @@ from THBSplines.src.abstract_mesh import Mesh
 
 
 class CartesianMesh(Mesh):
+    """
+    Attributes
+    ---------
+    knots: np.ndarray
+        knot vectors defining the mesh. They are not repeated.
+    dim: int
+        number of dimensions
+    cells: np.ndarray
+        represented as AABB, i.e each cell is identified by its bottom left and top right index [[min1, max1], [min2, max2], ..., ]. 
+        Is a list of N cells of shape (N, dim, 2).
+    nelems: int
+        number N of cells
+    cell_areas: np.ndarray
+        area of each cell of shape (N), 
+
+    Methods
+    ----------
+    refine(): 
+        returns a `CartesianMesh` with midpoints inserted in the current mesh.
+    get_sub_elements(box: np.ndarray):
+        Returns the indices of the cells that are contained in the region delimited by `box`,
+        where `box` contains the endpoints of a box.
+
+    """
 
     def plot_cells(self) -> None:
         pass
@@ -11,20 +35,20 @@ class CartesianMesh(Mesh):
     def get_gauss_points(self, cell_indices: np.ndarray) -> np.ndarray:
         pass
 
-    def __init__(self, knots, parametric_dimension):
+    def __init__(self, knots: list, parametric_dimension: int):
         """
         Represents a regular cartesian mesh in ``parametric_dimension`` dimensions.
 
         :param knots: knot vectors defining the mesh, a list of lists
         :param parametric_dimension: number of parametric directions
         """
-        self.knots = np.array([np.unique(knot_v) for knot_v in knots])
+        self.knots = [np.array(np.unique(knot_v)) for knot_v in knots]
         self.dim = parametric_dimension
-        self.cells = self.compute_cells()
+        self.cells = self._compute_cells()
         self.nelems = len(self.cells)
-        self.cell_area = np.prod(np.diff(self.cells[0][:]))
+        self.cell_areas = np.prod(np.diff(self.cells).reshape(-1, self.dim), axis=1)
 
-    def compute_cells(self) -> np.ndarray:
+    def _compute_cells(self) -> np.ndarray:
         """
         Computes an array of cells, represented as AABBs with each cell as [[min1, max1], [min2, max2], ..., ]
         :return: a list of N cells of shape (N, dim, 2).
@@ -33,22 +57,18 @@ class CartesianMesh(Mesh):
         knots_right = [k[1:] for k in self.knots]
         cells_bottom_left = np.stack(np.meshgrid(*knots_left), -1).reshape(-1, self.dim)
         cells_top_right = np.stack(np.meshgrid(*knots_right), -1).reshape(-1, self.dim)
-        cells = np.concatenate((cells_bottom_left, cells_top_right), axis=1).reshape(-1, self.dim, 2)
+        cells = np.transpose(np.stack((cells_bottom_left, cells_top_right)), (1,2,0))
 
-        # TODO: Make sure this edge case is not needed. For univariate meshes, the axes does NOT have to be swapped.
-        if self.dim != 1:
-            cells = np.swapaxes(cells, 1, 2)
-
-        return cells
+        return np.squeeze(cells)
 
     def refine(self) -> 'CartesianMesh':
         """
         Dyadic refinement of the mesh, by inserting midpoints in each knot vector.
         :return: a refined CartesianMesh object.
         """
-        refined_knots = np.array([
-            np.sort(np.concatenate((knot_v, (knot_v[1:] + knot_v[:-1]) / 2))) for knot_v in self.knots
-        ])
+        refined_knots = [
+            np.sort(np.concatenate((knot_v, (knot_v[1:] + knot_v[:-1]) / 2.))) for knot_v in self.knots
+        ]
         return CartesianMesh(refined_knots, self.dim)
 
     def get_sub_elements(self, box):
