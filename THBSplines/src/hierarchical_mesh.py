@@ -1,10 +1,340 @@
 import numpy as np
 from THBSplines.src.abstract_mesh import Mesh
 from THBSplines.src.cartesian_mesh import CartesianMesh
+from scipy.spatial import KDTree
+from collections import deque
+
+class CellNode:
+    "Tree node representing a cell in a hierarchical mesh."
+
+    __slots__ = ['level', 'index', 'parent', 'children', 'is_active',
+                 'is_refined']
+    
+    def __init__(self, level: int, index: int, parent=None):
+        self.level=level
+        self.index=index
+        self.parent=parent
+        self.children=[]
+        self.is_active = False
+        self.is_refined=False
+
+    def add_child(self, child_node):
+        self.children.append(child_node)
 
 
 class HierarchicalMesh(Mesh):
-    def plot_cells(self, return_fig = False) -> None:
+    """
+    Attributes
+    -------------
+    - nlevels: int
+        number of levels in the hierarhy
+    - meshes: CartesianMesh
+        Cartesian mesh structure for each level l and information about cells
+    - nodes: dict{int, CellNode}
+        lists of cells for each level
+    - aelem_level: dict{int, np.ndarray}
+        list of active cells for each level l
+    - delem_level: dict{int, np.ndarray}
+        list of deactivated cells for each level l
+    - nel_per_level: dict
+        number of active cells per level
+    - cell_area_per_level: dict
+        area of each cell for each level
+    - nel: int
+        number of cells
+    
+    Methods
+    -------------
+    - plot_cells():
+        plots the hierarchical mesh
+    - add_level():
+        adds a new level to the hierarchy by refining the current finest mesh
+    - refine(marked_cells):
+        refines the hierarchical mesh at the provided cells.
+    - refine_in_rectangle(rect, level):
+        Refines to level+1 all active cells at the specified level that are 
+        contained in or intersect the given rectangle.
+    -  get_children(level, marked_cells):
+        get children of marked cells at given level, i.e for cells Q_i^l, returns fine cells 
+        {Q_k^{l+1}|there exists i such that Q_k^{l+1}⊆Q_i^l}
+    - get_parent(level, marked_cells):
+        For given level l and marked cells {Q_i^l}, returns coarse cells {Q_k^{l-1}| there exists k such that Q_i^l⊆Q_k^{l-1}}
+
+    """
+
+    def __init__(self, knots, dim):
+        self.meshes = [CartesianMesh(knots, dim)]
+        self.nlevels = 1
+        self.dim=dim
+
+        self.nodes = {0: [CellNode(level=0,index=i) for i in range(self.meshes[0].nelems)]}
+        for node in self.nodes[0]:
+            node.is_active=True
+
+        self._aelem_level_set = {0: set(range(self.meshes[0].nelems))}  # active elements on level
+        self._delem_level_set = {0: set()}  # deactivated elements on level
+
+        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=int)}
+        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=int)}
+        self.nel_per_level = {0: self.meshes[0].nelems}
+
+        self.cell_area_per_level = {0: self.meshes[0].cell_areas}
+        self.nel = self.meshes[0].nelems
+    pass
+
+
+    def add_level(self):
+        """
+        Adds a new level and constructs tree edges (parent-child relationships) .
+        """
+        coarse_level=self.nlevels-1
+        fine_level=self.nlevels
+        coarse_mesh = self.meshes[-1] #CartesianMesh
+        fine_mesh = coarse_mesh.refine()
+        self.meshes.append(fine_mesh)
+        self.nlevels += 1
+
+        # Initialise new attributes
+        self._aelem_level_set[fine_level] = set()
+        self._delem_level_set[fine_level] = set()
+        self.aelem_level[fine_level] = np.array([], dtype=int)
+        self.delem_level[fine_level] = np.array([], dtype=int)
+        self.nel_per_level[fine_level]=0
+        self.cell_area_per_level[fine_level] = fine_mesh.cell_areas
+
+        coarse_centers = np.mean(coarse_mesh.cells, axis=-1)
+        fine_centers = np.mean(fine_mesh.cells, axis=-1)
+        if self.dim == 1:
+            coarse_centers = coarse_centers[:, None]
+            fine_centers = fine_centers[:, None]
+            
+        tree = KDTree(coarse_centers)
+
+
+        k_neighbours = min(3**self.dim, len(coarse_centers))
+        #a 1D mesh has two neighbours, which makes three elts including itself
+        # a 2D mesh has 8 neighbours (including corners), which makes nine elts including itself
+        # a 3D mesh has 26 neighbouts, etc
+
+        # Returns index of each neighbour in tree.data
+        # The parent cell is guaranteed to be in the closest k_neighbours coarse centroids
+        _, indices = tree.query(fine_centers, k=k_neighbours)
+        if k_neighbours == 1:
+            indices = indices[:, None]
+
+        c_min = coarse_mesh.cells[..., 0]
+        c_max = coarse_mesh.cells[..., 1]
+        eps = np.spacing(1)
+        self.nodes[fine_level] = []
+        coarse_nodes = self.nodes[coarse_level]
+
+        # Find parent cell of each fine cell
+        for i, fine_center in enumerate(fine_centers):
+            parent_idx = -1
+            # Verify exact geometrical inclusion to discard unwanted neighbours
+            for candidate in indices[i]:
+                if np.all(fine_center >= c_min[candidate] - eps) and np.all(fine_center <= c_max[candidate] + eps):
+                    parent_idx = candidate
+                    break #only breaks the inner loop
+                pass
+            pass
+            # Geometric checking if tree based approach failed
+            if parent_idx == -1:
+                fine_cell_min = fine_mesh.cells[i, :, 0] + eps
+                fine_cell_max = fine_mesh.cells[i, :, 1] - eps
+                valid = np.all((fine_cell_min >= c_min) & (fine_cell_max <= c_max), axis=-1)
+                parent_idx = np.argmax(valid)
+            pass
+            # Get identified parent node
+            parent_node = coarse_nodes[parent_idx] #CellNode
+            # Create corresponding child_node
+            child_node = CellNode(level=fine_level, index=i, parent=parent_node)
+            # Make parent keep record of created child
+            parent_node.add_child(child_node)
+            self.nodes[fine_level].append(child_node) #Dict of nodes
+        pass
+    pass
+
+    def refine(self, marked_cells: np.ndarray, at_level: int):
+        """
+        Refines the hierarchical mesh, and updates the global element indices
+        of active elements for each level.
+
+        :param marked_cells: indices of cells marked for refinement
+        :param at_level: level at which the refinement should take place
+        :return: updated elements
+        """
+
+        if at_level>=self.nlevels-1:
+            while(self.nlevels<=at_level+1):
+                self.add_level()
+
+        # old_active_cells = self.aelem_level
+        self._update_active_cells(marked_cells, at_level=at_level)
+        self.nel=0
+        for l in range(self.nlevels):
+            self.aelem_level[l] = np.array(sorted(list(self._aelem_level_set[l])), dtype=int)
+            self.delem_level[l] = np.array(sorted(list(self._delem_level_set[l])), dtype=int)
+            self.nel_per_level[l] = len(self.aelem_level[l])
+            self.nel += self.nel_per_level[l]
+        pass
+    pass
+
+    def _update_active_cells(self, marked_cells, at_level: int):
+        """
+        Updates the set of active cells and deactivated cells.
+
+        :param marked_cells: indices of cells marked for refinement
+        :return: returns the newly added cells
+        """
+        # Uniquely identify all cells to be refined at a certain level
+        nodes_to_refine = set()
+        for idx in np.atleast_1d(marked_cells):
+            nodes_to_refine.add(self.nodes[at_level][idx])
+        pass
+            
+
+        # 1. BOTTOM-UP: Identify all ancestors that need to be refined.
+        queue = deque(nodes_to_refine)
+        while queue:
+            # Identify a cell that needs to be refined
+            node = queue.popleft()
+            # If the cell's parent is not refined
+            if node.parent and not node.parent.is_refined:
+                # Add the parent node to the refinement list
+                nodes_to_refine.add(node.parent)
+                # Check if its parents need to be refined as well
+                queue.append(node.parent)
+            pass
+        pass
+
+
+        # 2. TOP-DOWN: Apply refinements iteratively
+        sorted_nodes = sorted(list(nodes_to_refine), key=lambda x: x.level)
+        for node in sorted_nodes:
+            # If cell is not refined 
+            if not node.is_refined:
+                # Deactivate it and mark it as refined
+                node.is_active = False
+                node.is_refined = True
+                
+                # Add the parent to the set of deactivated cells
+                self._delem_level_set[node.level].add(node.index)
+                # Remove it from the set of active cells if necessary
+                if node.index in self._aelem_level_set[node.level]:
+                    self._aelem_level_set[node.level].remove(node.index)
+                pass
+                
+                # Activate children and add indices to the set of active cells.
+                for child in node.children:
+                    child.is_active = True
+                    self._aelem_level_set[child.level].add(child.index)
+                pass
+            pass
+        pass
+    pass
+
+    def get_children(self, level: int, marked_cells_at_level: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        For given level l and marked cells {Q_i^l}, returns fine cells {Q_k^{l+1}| there exists i such that Q_k^{l+1}⊆Q_i^l}
+
+        Parameters
+        -------------
+        - level: level of parent cells. The returned cells will be those corresponding to `level+1`
+        - marked_cells_at_level: indices of cells whose children are sought
+
+        Returns
+        --------------------
+        - [coarse_cells, indices]: tuple of numpy array with local indices of coarse cells and their corresponding children global indices.
+        If only the children of the given cells are wanted, one should only use the second return argument and 
+        get the children cells with fine_mesh.cells[indices].
+        """
+        coarse_cells, indices = [], []
+        for idx in np.atleast_1d(marked_cells_at_level):
+            node = self.nodes[level][idx]
+            for child in node.children:
+                coarse_cells.append(idx)
+                indices.append(child.index)
+            pass
+        pass
+
+        return np.array(coarse_cells, dtype=int), np.array(indices, dtype=int)
+    
+    def get_parent(self, level:int, marked_cells_at_level: np.ndarray) -> np.ndarray:
+        """
+        For given level l and marked cells {Q_i^l}, returns coarse cells {Q_k^{l-1}| there exists k such that Q_i^l⊆Q_k^{l-1}}
+
+        Parameters
+        -------------
+        - level: level of children cells. The returned cells will be those corresponding to `level-1`
+        - marked_cells_at_level: indices of cells whose parents are sought
+
+        Returns
+        --------------------
+        - [fine_cells, indices]: tuple of numpy array with local indices of fine cells and their corresponding parent global indices.
+        If only the parents of the given cells are wanted, one should only use the second return argument and 
+        get the parent cells with coarse_mesh.cells[indices].
+        """
+        assert level>0, "Parents of cells at level 0 do not exist"
+
+        fine_cells, indices = [], []
+        for idx in np.atleast_1d(marked_cells_at_level):
+            node = self.nodes[level][idx]
+            for parent in node.parent:
+                fine_cells.append(idx)
+                indices.append(parent.index)
+            pass
+        pass
+        return np.array(fine_cells, dtype=int), np.array(indices, dtype=int)
+    
+    def refine_in_rectangle(self, rect, level: int):
+        """
+        Refines to level+1 all active cells at the specified level that are 
+        contained in or intersect the given rectangle. The region is naturally 
+        expanded to the cell boundaries to avoid L-shaped refinement patches.
+        
+        :param rect: list or np.ndarray of shape (dim, 2) defining the rectangle.
+                     Format: [[min1, max1], [min2, max2], ..., [mind, maxd]]
+        :param level: the level of cells to be evaluated and refined
+        """
+        if level >= self.nlevels-1:
+            while(self.nlevels<=level+1):
+                self.add_level()
+            pass
+        pass
+        
+        rect = np.atleast_2d(rect)
+        if rect.shape != (self.dim, 2):
+            raise ValueError(f"Rectangle must have shape ({self.dim}, 2). Got {rect.shape}")
+            
+        cells = self.meshes[level].cells
+        cell_mins = cells[..., 0]
+        cell_maxs = cells[..., 1]
+        rect_mins = rect[:, 0]
+        rect_maxs = rect[:, 1]
+
+        eps = np.spacing(1) * 10
+        
+        if self.dim==1:
+            intersect_mask = (cell_maxs>rect_mins+eps)&(cell_mins<rect_maxs-eps) 
+        else:
+            intersect_mask = np.all(
+                (cell_maxs > rect_mins + eps) & (cell_mins < rect_maxs - eps), 
+                axis=1
+            )
+        pass
+        marked_cells = np.where(intersect_mask)[0]
+        
+        if len(marked_cells) > 0:
+            # Our existing `refine` method gracefully handles overlapping 
+            # or previously refined cells thanks to the graph-based top-down logic.
+            self.refine(marked_cells, at_level=level)
+        else:
+            print("No cells intersected the provided rectangle.")
+        pass
+        
+
+    def plot_cells(self, figsize=(10,5), return_fig = False) -> None:
         """
         Plots the hierarchical mesh, and optionally returns the figure handle.
         Otherwise, the figure is displayed.
@@ -13,14 +343,51 @@ class HierarchicalMesh(Mesh):
         :return: plt.fig handle if return_fig is true, None otherwise.
         """
         import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
 
-        fig = plt.figure()
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.get_cmap('tab10', max(10, self.nlevels))
         for level in range(self.nlevels):
             active_cells = self.meshes[level].cells[self.aelem_level[level]]
-            for cell in active_cells:
-                x = cell[0, [0, 1, 1, 0, 0]]
-                y = cell[1, [0, 0, 1, 1, 0]]
-                plt.plot(x, y, color='black')
+            if self.meshes[0].dim==2:
+                for cell in active_cells:
+                    x = cell[0, [0, 1, 1, 0, 0]]
+                    y = cell[1, [0, 0, 1, 1, 0]]
+                    plt.plot(x, y, color='black')
+            elif self.meshes[0].dim==1:
+                for cell in active_cells:
+                    xmin, xmax = cell[0], cell[1]
+                    width = xmax - xmin
+                    height = 1.0 # arbitrary
+                    
+                    # Draw a colored rectangle for each 1D element
+                    rect = plt.Rectangle((xmin, -height/2), width, height,
+                                         edgecolor='black',
+                                         facecolor=colors(level),
+                                         alpha=0.6,
+                                         linewidth=1.5)
+                    ax.add_patch(rect)
+            else:
+                print('Dimensions 3 and higher are not displayed')
+                plt.close(fig)
+                return
+            pass
+        pass
+        if self.meshes[0].dim == 1:
+            ax.set_ylim(-2, 2)
+            ax.set_yticks([]) # Hide the arbitrary y-axis values
+            ax.set_xlabel('Parametric Domain')
+            
+            # Create a custom legend so you know which color is which level
+            handles = [mpatches.Patch(color=colors(l), alpha=0.6, label=f'Level {l}') 
+                       for l in range(self.nlevels)]
+            # Only show legend if we have more than 1 level
+            if self.nlevels > 1:
+                ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left')
+                
+            ax.autoscale_view()
+
+        plt.tight_layout()
         if return_fig:
             return fig
         else:
@@ -28,82 +395,6 @@ class HierarchicalMesh(Mesh):
 
     def get_gauss_points(self, cell_indices: np.ndarray) -> np.ndarray:
         pass
-
-    def __init__(self, knots, dim):
-        self.meshes = [CartesianMesh(knots, dim)]
-        self.nlevels = 1
-        self.aelem_level = {0: np.array((range(self.meshes[0].nelems)), dtype=int)}  # active elements on level
-        self.delem_level = {0: np.array([], dtype=int)}  # deactivated elements on level
-        self.nel_per_level = {0: self.meshes[0].nelems}
-        self.nel = self.meshes[0].nelems
-        self.cell_area_per_level = {0: self.meshes[0].cell_area}
-
-    def add_level(self):
-        """
-        Adds a new level to the hierarchical mesh, by refining the finest mesh.
-        """
-        self.nlevels += 1
-        self.meshes.append(self.meshes[-1].refine())
-
-        self.aelem_level[self.nlevels - 1] = (np.array([], dtype=int))
-        self.delem_level[self.nlevels - 1] = (np.array([], dtype=int))
-        self.cell_area_per_level[self.nlevels - 1] = self.meshes[-1].cell_area
-
-
-    def refine(self, marked_cells: dict):
-        """
-        Refines the hierarchical mesh, and returns the global element indices
-        of active elements for each level.
-
-        :param marked_cells: indices of cells marked for refinement
-        :return: updated elements
-        """
-
-        while self.nlevels - 1 <= max(marked_cells.keys()):
-            self.add_level()
-
-        # old_active_cells = self.aelem_level
-        new_elements = self.update_active_cells(marked_cells)
-
-        return new_elements
-
-    def update_active_cells(self, marked_cells):
-        """
-        Updates the set of active cells and deactivated cells.
-
-        :param marked_cells: indices of cells marked for refinement
-        :return: returns the newly added cells
-        """
-
-        number_of_levels = len(marked_cells)
-        new_cells = {}
-
-        for level in range(number_of_levels):
-            if level in marked_cells:
-                i = np.flatnonzero(np.isin(marked_cells[level], self.aelem_level[level]))
-                marked_active_elements = np.take(marked_cells[level], i)
-                self.aelem_level[level] = np.setdiff1d(self.aelem_level[level], marked_active_elements).astype(int)
-                self.delem_level[level] = np.union1d(self.delem_level[level], marked_cells[level]).astype(int)
-
-                new_cells[level + 1] = self.get_children(level, marked_cells[level])
-                self.aelem_level[level + 1] = np.union1d(self.aelem_level[level + 1], new_cells[level + 1]).astype(int)
-
-        self.nel_per_level = {level: len(self.aelem_level[level]) if level in self.aelem_level else 0 for level in
-                              range(self.nlevels)}
-        self.nel = sum(self.nel_per_level.values())
-
-        return new_cells
-
-    def get_children(self, level: int, marked_cells_at_level) -> np.ndarray:
-        children = np.array([])
-        fine_cells = self.meshes[level + 1].cells
-        eps = np.spacing(1)
-        for cell_idx in marked_cells_at_level:
-            cell = self.meshes[level].cells[cell_idx]
-            i = np.flatnonzero(np.all((cell[:, 0] <= fine_cells[:, :, 0] + eps) & (eps + cell[:, 1] >= fine_cells[:, :, 1]),
-                                      axis=1))
-            children = np.union1d(children, i)
-        return children.astype(int)
 
 
 if __name__ == '__main__':
