@@ -5,7 +5,7 @@ import numpy as np
 import scipy.sparse as sp
 from THBSplines.src.abstract_space import Space
 from THBSplines.src.hierarchical_mesh import HierarchicalMesh
-from THBSplines.src.tensor_product_space import TensorProductSpace, TensorProductSpace2D
+from THBSplines.src.tensor_product_space import TensorProductSpace, UnivariateSplineSpace
 
 
 class HierarchicalSpace(Space):
@@ -16,58 +16,46 @@ class HierarchicalSpace(Space):
     def basis_to_cell(self, basis_indices: Union[np.ndarray, List[int]]) -> np.ndarray:
         pass
 
-    def __init__(self, knots, degrees, dim):
-        """
-        Initialize a hierarchical space with a base mesh and space over the
-        given knot vectors
-
-        :param knots: tensor product knot vectors
-        :param degrees: correpsonding tensor product degrees
-        :param dim: parametric dimension
-        """
+    def __init__(self, knots: list, degrees: list):
+        """Initialise one level """
+        self.degrees = np.atleast_1d(degrees)
+        if len(self.degrees)==1:
+            self.degrees = self.degrees*np.ones(len(knots))
+        else:
+            assert len(knots)==len(self.degrees), "There are not enough degrees for the given knots."
+        self.dim = len(knots)
+        self.mesh = HierarchicalMesh(knots=knots, dim=self.dim)
+        univariate_spline_spaces = [UnivariateSplineSpace(degree=self.degrees[d], knots=knots[d]) for d in range(self.dim)]
+        self.level_spaces = {0: TensorProductSpace(dim=self.dim, univariate_spaces=univariate_spline_spaces)}
         self.nlevels = 1
-        self.spaces = [TensorProductSpace(knots, degrees, dim)] if dim != 2 else [TensorProductSpace2D(knots, degrees, dim)]
-        self.mesh = HierarchicalMesh(knots, dim)
-        self.afunc_level = {0: np.array((range(self.spaces[0].nfuncs)), dtype=np.int)}  # active functions on level
-        self.dfunc_level = {0: np.array([], dtype=np.int)}  # deactivated functions on level
-        self.nfuncs_level = {0: self.spaces[0].nfuncs}
-        self.nfuncs = self.nfuncs_level[0]
-        self.projections_onedim = []
-        self.afunc = np.array([], np.int)
-        self.dfunc = np.array([], np.int)
-        self.truncated = True
-        self.degrees = degrees
-        self.dim = dim
+        self.active_functions = {0: np.arange(self.level_spaces[0].nfuncs_total)}
+        self.deactivated_functions = {0: np.array([], dtype=int)}
+        self.refinement_operators = {0: [uni_spline_space.Rs for uni_spline_space in univariate_spline_spaces]}
+        self.bezier_operators = {0: [uni_spline_space.bezier for uni_spline_space in univariate_spline_spaces]}
+        
 
-    def refine(self, marked_functions: dict, new_cells: dict):
+    def refine(self, rectangle: np.ndarray, level: int):
         """
-        Refine the hierarchical space.
+        Refine the hierarchical space in the given rectangle.
 
         :param marked_functions: marked functions/cells to refine
-        :param new_cells: global indices of new active cells for each level, as returned by ``HierarchicalMesh.refine``.
+        :param new_cells: global indices of new active cells for each level, as returned by `HierarchicalMesh.refine`.
         """
 
-        if len(self.spaces) < self.mesh.nlevels:
+        self.mesh.refine_in_rectangle(rect=rectangle, level=level)
+        while level>=self.nlevels+1:
             self.add_level()
-            marked_functions[self.mesh.nlevels] = np.array([], dtype=np.int)
-
-        self.update_active_functions(marked_functions, new_cells)
+        self.update_active_functions()
 
     def add_level(self):
         """
-        Adds a level l of refinement to the hierarchical space, update active and inactive functions on previous level (l-1)
+        Adds a level l of refinement to the hierarchical space.
         """
-        if len(self.spaces) == self.mesh.nlevels - 1:
-            refined_space, projector_onedim = self.spaces[self.mesh.nlevels - 2].refine()
+        l = self.nlevels
+        self.nlevels+=1
+        #univariate_spline_spaces = [self.level_spaces[l].spaces[d].refine() for d in range(self.dim)]
+        self.level_spaces[self.nlevels] = self.level_spaces[l].refine(dims=self.dims)
 
-            self.spaces.append(refined_space)
-            self.projections_onedim.append(projector_onedim)
-            self.nlevels += 1
-            self.afunc_level[self.mesh.nlevels - 1] = np.array([], dtype=np.int)
-            self.dfunc_level[self.mesh.nlevels - 1] = np.array([], dtype=np.int)
-            self.nfuncs_level[self.mesh.nlevels - 1] = 0
-        else:
-            raise ValueError('Non-compatible mesh and space levels')
 
     def get_basis_conversion_matrix(self, level, coarse_indices=None):
         """
@@ -176,7 +164,7 @@ class HierarchicalSpace(Space):
                              range(self.nlevels)}
         self.nfuncs = sum(self.nfuncs_level.values())
 
-    def get_children(self, level, marked_functions_at_level):
+    def get_children(self, level, marked_functions_at_level, tol: float=1e-7):
         """
         Return the indices of the children function of the marked functions
         at the given level.
@@ -186,12 +174,23 @@ class HierarchicalSpace(Space):
         :return: np.array of indices
         """
 
-        children = np.array([], dtype=np.int)
-        projection = self.compute_full_projection_matrix(level)
-        for func_idx in marked_functions_at_level:
-            c = np.flatnonzero(projection[:, func_idx].toarray())
-            children = np.union1d(children, c)
-        return children
+        supports_of_marked_functions = self.spaces[level].basis_supports[marked_functions_at_level]
+        supports_of_finer_functions = self.spaces[level+1].basis_supports
+        min_finer = supports_of_finer_functions[:, :, 0]
+        max_finer = supports_of_finer_functions[:, :, 1]
+        
+        min_marked = supports_of_marked_functions[:, :, 0]
+        max_marked = supports_of_marked_functions[:, :, 1]
+        is_min_inside = min_finer >= (min_marked[:, None, :] - tol)
+        is_max_inside = max_finer <= (max_marked[:, None, :] + tol)
+        is_child = np.all(is_min_inside & is_max_inside, axis=2)
+        # A finer function is a child if it is contained in AT LEAST ONE marked function.
+        is_child_of_any = np.any(is_child, axis=0)
+
+        # Get the 1D indices of the finer functions that returned True
+        indices = np.where(is_child_of_any)[0]
+        
+        return indices
 
     def functions_to_deactivate_from_cells(self, marked_cells: dict):
         """
