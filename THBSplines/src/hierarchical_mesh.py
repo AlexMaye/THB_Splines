@@ -11,14 +11,14 @@ class CellNode:
                  'is_refined']
     
     def __init__(self, level: int, index: int, parent=None):
-        self.level=level
-        self.index=index
-        self.parent=parent
-        self.children=[]
-        self.is_active = False
-        self.is_refined=False
+        self.level: int=level
+        self.index: int=index
+        self.parent: CellNode=parent
+        self.children: list[CellNode]=[]
+        self.is_active: bool = False
+        self.is_refined: bool=False
 
-    def add_child(self, child_node):
+    def add_child(self, child_node: "CellNode"):
         self.children.append(child_node)
 
 
@@ -90,7 +90,7 @@ class HierarchicalMesh(Mesh):
         coarse_level=self.nlevels-1
         fine_level=self.nlevels
         coarse_mesh = self.meshes[-1] #CartesianMesh
-        fine_mesh = coarse_mesh.refine()
+        fine_mesh = coarse_mesh.refine() # refine method of CartesianMesh
         self.meshes.append(fine_mesh)
         self.nlevels += 1
 
@@ -110,7 +110,6 @@ class HierarchicalMesh(Mesh):
             
         tree = KDTree(coarse_centers)
 
-
         k_neighbours = min(3**self.dim, len(coarse_centers))
         #a 1D mesh has two neighbours, which makes three elts including itself
         # a 2D mesh has 8 neighbours (including corners), which makes nine elts including itself
@@ -126,7 +125,7 @@ class HierarchicalMesh(Mesh):
         c_max = coarse_mesh.cells[..., 1]
         eps = np.spacing(1)
         self.nodes[fine_level] = []
-        coarse_nodes = self.nodes[coarse_level]
+        coarse_nodes: list[CellNode] = self.nodes[coarse_level]
 
         # Find parent cell of each fine cell
         for i, fine_center in enumerate(fine_centers):
@@ -146,8 +145,7 @@ class HierarchicalMesh(Mesh):
                 parent_idx = np.argmax(valid)
             pass
             # Get identified parent node
-            parent_node = coarse_nodes[parent_idx] #CellNode
-            # Create corresponding child_node
+            parent_node: CellNode = coarse_nodes[parent_idx] # Create corresponding child_node
             child_node = CellNode(level=fine_level, index=i, parent=parent_node)
             # Make parent keep record of created child
             parent_node.add_child(child_node)
@@ -168,6 +166,8 @@ class HierarchicalMesh(Mesh):
         if at_level>=self.nlevels-1:
             while(self.nlevels<=at_level+1):
                 self.add_level()
+            pass
+        pass
 
         # old_active_cells = self.aelem_level
         self._update_active_cells(marked_cells, at_level=at_level)
@@ -188,17 +188,17 @@ class HierarchicalMesh(Mesh):
         :return: returns the newly added cells
         """
         # Uniquely identify all cells to be refined at a certain level
-        nodes_to_refine = set()
+        nodes_to_refine: set[CellNode] = set()
         for idx in np.atleast_1d(marked_cells):
             nodes_to_refine.add(self.nodes[at_level][idx])
         pass
             
 
         # 1. BOTTOM-UP: Identify all ancestors that need to be refined.
-        queue = deque(nodes_to_refine)
+        queue: deque[CellNode] = deque(nodes_to_refine)
         while queue:
             # Identify a cell that needs to be refined
-            node = queue.popleft()
+            node: CellNode = queue.popleft()
             # If the cell's parent is not refined
             if node.parent and not node.parent.is_refined:
                 # Add the parent node to the refinement list
@@ -212,7 +212,7 @@ class HierarchicalMesh(Mesh):
         # 2. TOP-DOWN: Apply refinements iteratively
         sorted_nodes = sorted(list(nodes_to_refine), key=lambda x: x.level)
         for node in sorted_nodes:
-            # If cell is not refined 
+            # If cell is not already refined 
             if not node.is_refined:
                 # Deactivate it and mark it as refined
                 node.is_active = False
@@ -271,21 +271,49 @@ class HierarchicalMesh(Mesh):
 
         Returns
         --------------------
-        - [fine_cells, indices]: tuple of numpy array with local indices of fine cells and their corresponding parent global indices.
-        If only the parents of the given cells are wanted, one should only use the second return argument and 
-        get the parent cells with coarse_mesh.cells[indices].
+        - indices: parent global at level `level-1`.
         """
         assert level>0, "Parents of cells at level 0 do not exist"
+        assert np.max(marked_cells_at_level)<len(self.nodes[level]), "There aren't as many cells at that level."
+        assert np.min(marked_cells_at_level)>=0, "Cells indices cannot be negative."
+        marked_cells_at_level = np.atleast_1d(marked_cells_at_level)
+        if len(marked_cells_at_level)==1:
+            return self.nodes[level][marked_cells_at_level[0]].parent.index
 
-        fine_cells, indices = [], []
-        for idx in np.atleast_1d(marked_cells_at_level):
-            node = self.nodes[level][idx]
-            for parent in node.parent:
-                fine_cells.append(idx)
-                indices.append(parent.index)
-            pass
+        indices = np.empty_like(marked_cells_at_level)
+        for i, idx in enumerate(marked_cells_at_level):
+            node: CellNode = self.nodes[level][idx]
+            parent_node: CellNode = node.parent
+            #fine_cells.append(idx)
+            indices[i] = parent_node.index
         pass
-        return np.array(fine_cells, dtype=int), np.array(indices, dtype=int)
+        return indices
+    
+    def get_parent_at_level(self, start_level: int, stop_level: int, marked_cells_at_start_level: np.ndarray)->np.ndarray:
+        """Returs parents of `marked_cells_at_start_level` at level `stop_level`. """
+        assert start_level>=0 and stop_level>=0 and stop_level<=start_level and start_level<=self.nlevels
+        assert np.max(marked_cells_at_start_level)<len(self.nodes[start_level]), "There aren't as many cells at that level."
+        assert np.min(marked_cells_at_start_level)>=0, "Cells indices cannot be negative."
+        if stop_level==start_level:
+            return np.squeeze(marked_cells_at_start_level)
+        if stop_level==start_level-1:
+            return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level)
+        
+        marked_cells_at_start_level = np.atleast_1d(marked_cells_at_start_level)
+
+        if len(marked_cells_at_start_level)==1:
+            parent_node = self.nodes[start_level][marked_cells_at_start_level[0]].parent
+            for _ in range(1, start_level-stop_level):
+                parent_node = parent_node.parent
+            pass
+            return parent_node.index
+        
+        for level in range(start_level, stop_level, -1):
+            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level)
+        return marked_cells_at_start_level
+
+            
+
     
     def refine_in_rectangle(self, rect, level: int):
         """
@@ -307,7 +335,7 @@ class HierarchicalMesh(Mesh):
         if rect.shape != (self.dim, 2):
             raise ValueError(f"Rectangle must have shape ({self.dim}, 2). Got {rect.shape}")
             
-        cells = self.meshes[level].cells
+        cells: np.ndarray = self.meshes[level].cells
         cell_mins = cells[..., 0]
         cell_maxs = cells[..., 1]
         rect_mins = rect[:, 0]
@@ -378,7 +406,7 @@ class HierarchicalMesh(Mesh):
             ax.set_yticks([]) # Hide the arbitrary y-axis values
             ax.set_xlabel('Parametric Domain')
             
-            # Create a custom legend so you know which color is which level
+            # Create a custom legend to know which color is which level
             handles = [mpatches.Patch(color=colors(l), alpha=0.6, label=f'Level {l}') 
                        for l in range(self.nlevels)]
             # Only show legend if we have more than 1 level
