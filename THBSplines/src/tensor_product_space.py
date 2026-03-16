@@ -27,7 +27,8 @@ class UnivariateSplineSpace(Space):
     def __init__(self, degree: int, knots: np.ndarray):
         self.degree = degree
         self.knots = np.sort(knots)
-        _, mults = np.unique(self.knots, return_counts=True)
+        uniquekn, mults = np.unique(self.knots, return_counts=True)
+        assert np.all(np.diff(uniquekn)==np.diff(uniquekn)[0]), "Only equally spaced knots are supported."
         if mults[0]<self.degree+1:
             self.knots = np.append(self.knots[0]*np.ones(self.degree+1-mults[0]), self.knots)
         if mults[-1]<self.degree+1:
@@ -98,6 +99,9 @@ class UnivariateSplineSpace(Space):
         # Map those knots to physical cell boundaries
         start_cells = self.knot_to_unique[start_knot_idxs]
         end_cells = self.knot_to_unique[end_knot_idxs]
+
+        if len(basis_indices)==1:
+            return [np.arange(start_cells, end_cells)]
         
         # Return the range of cells
         # A list comprehension is necessary since BSplines do not span over the same amount of cells
@@ -304,6 +308,38 @@ class UnivariateSplineSpace(Space):
                 return False
                 
         return True
+    
+
+    def _get_fine_cells_in_coarse_cell(self, coarse_cell: int, cell_size: float):
+        "Get the indices "
+        finekn = self.knots
+        factor = int(cell_size/np.max(np.diff(finekn)))
+        if factor==1:
+            print('Finer knots are as fine as coarse knots')
+            return np.atleast_1d(coarse_cell)
+        
+        return np.arange(factor)+coarse_cell*factor
+
+    def get_children_functions(self, coarse_func_idx: int, fine_space: "UnivariateSplineSpace")->np.ndarray:
+        "Does not work"
+        return
+        coarse_cells = self.basis_to_cell_indices(basis_indices=coarse_func_idx)[0]
+
+        children_1d=set()
+
+        for c_cell in coarse_cells:
+            R_local = self.Rs[c_cell]
+            active_coarse_funcs = self.cell_to_basis_indices(cell_indices=c_cell)[0]
+            local_row = np.where(active_coarse_funcs == coarse_func_idx)[0][0]
+            non_zero_local_cols = np.where(R_local[local_row, :] > 1e-12)[0]
+            fine_cells_in_c = fine_space._get_fine_cells_in_coarse_cell(coarse_cell=c_cell, cell_size=np.max(np.diff(self.unique_knots)))
+            active_fine_funcs = fine_space.cell_to_basis_indices(cell_indices=fine_cells_in_c)
+        
+            # Map the non-zero local columns to global fine indices
+            global_fine_children = active_fine_funcs[:, non_zero_local_cols]
+            children_1d.update(global_fine_children.ravel())
+            
+        return np.array(list(children_1d), dtype=int)
 
 
 class TensorProductSpace(Space):
@@ -377,15 +413,49 @@ class TensorProductSpace(Space):
         :param dim: the number of parametric directions
         """
         assert len(univariate_spaces) == dim
-        self.dim = dim
-        self.spaces = univariate_spaces
-        self.degrees = np.array([space.degree for space in self.spaces])
+        assert dim<=3, "Dimensions higher than 3 are not supported."
+        self.dim: int = dim
+        self.spaces: list[UnivariateSplineSpace] = univariate_spaces
+        self.degrees: np.ndarray = np.array([space.degree for space in self.spaces])
         # The total number of basis functions in this flat space
         self.nfuncs_onedim = [space.nfuncs for space in self.spaces]
         self.nfuncs_total = np.prod(self.nfuncs_onedim)
         self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
+        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total)), dtype=object)
+        refinement_operators = []
+        if self.dim==1:
+            self.refinement_operators = [sp.bsr_array(self.spaces[0].Rs[i], 
+                                                      blocksize=(self.degrees[0]+1, self.degrees[0]+1),
+                                                      ) for i in range(len(self.spaces[0].Rs))]
+        else:
+            for rs0 in self.spaces[0].Rs:
+                for rs1 in self.spaces[1].Rs:
+                    refinement_operators.append(sp.bsr_array(sp.kron(rs0, rs1, format='bsr'), 
+                                                             blocksize=(self.degrees[1]+1, self.degrees[1]+1)))
+            if self.dim==3:
+                refinement_operators3d = []
+                for i in range(len(refinement_operators)):
+                    for rs2 in self.spaces[2].Rs:
+                        refinement_operators3d.append(sp.bsr_array(sp.kron(refinement_operators[i], rs2, format='bsr'),
+                                                                   blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
+                    pass
+                pass
+                self.refinement_operators = refinement_operators3d
+            else:
+                self.refinement_operators = refinement_operators
 
-    def basis_to_cell(self, basis_indices: np.ndarray) -> np.ndarray:
+
+    def basis_to_cell(self, basis_indices: np.ndarray)->np.ndarray:
+        """
+        Returns the indices of cells in the support of the passed basis
+        indices. The 'inverse' of cell_to_basis.
+
+        :param basis_indices: a list/array of indices
+        :return: a nested list of index-sets corresponding to cells in the support of the provided basis functions.
+        """
+        return self.cell_supports[basis_indices]
+
+    def _basis_to_cell(self, basis_indices: np.ndarray) -> np.ndarray:
         """
         Returns the indices of cells in the support of the passed basis
         indices. The 'inverse' of cell_to_basis.
@@ -426,11 +496,12 @@ class TensorProductSpace(Space):
         :param cell_list: Numpy array containing the indices of cells.
         :return: numpy array containing the indices of basis functions.
         """
+        cell_list = np.atleast_1d(cell_list)
         if len(cell_list) == 0:
-            print('No cell list was provided in get_basis_function')
+            print('No cell list was provided in cell_to_basis().')
             return np.array([], dtype=int)
         
-        grid_shape=self.mesh.shape
+        grid_shape: tuple[int]=self.mesh.shape
 
         # 1. Convert flat cell index to (ix, iy) tuple
         tensor_idx = np.unravel_index(cell_list, grid_shape)
@@ -548,7 +619,7 @@ class TensorProductSpace(Space):
         uni_spline_spaces = self.spaces
         fine_uss = []
         for i, spline_space in enumerate(uni_spline_spaces):
-            new_spline_space = spline_space.refine(knots=spline_space.knots, p=spline_space.degree) if i in dims else spline_space
+            new_spline_space: np.ndarray = spline_space.refine(knots=spline_space.knots, p=spline_space.degree) if i in dims else spline_space
             fine_uss.append(UnivariateSplineSpace(degree=spline_space.degree, knots=new_spline_space))
 
         #projection_onedim = self.compute_projection_matrix(coarse_knots, fine_knots, self.degrees)
