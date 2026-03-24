@@ -43,10 +43,11 @@ class CartesianMesh(Mesh):
         :param parametric_dimension: number of parametric directions
         """
         assert len(knots)==parametric_dimension, 'Dimension and knots do not match.'
-        self.knots = [np.array(np.unique(knot_v)) for knot_v in knots]
+        self.knots = [np.sort(np.unique(knot_v)) for knot_v in knots]
         for knot_v in self.knots:
             assert len(knot_v)>1, 'Given mesh is degenerate.'
         self.dim = parametric_dimension
+        assert 0<self.dim<4, "Only meshes in up to three dimensions are currently supported"
         self.cells = self._compute_cells()
         self.nelems = len(self.cells)
         self.cell_areas = np.prod(np.diff(self.cells).reshape(-1, self.dim), axis=1)
@@ -64,6 +65,26 @@ class CartesianMesh(Mesh):
         cells = np.transpose(np.stack((cells_bottom_left, cells_top_right)), (1,2,0))
 
         return np.squeeze(cells)
+    
+    def find_index(self, point):
+        point = np.atleast_1d(point)
+        assert len(point)==self.dim, "point does not have the correct amount of dimensions."
+        indices = np.empty(self.dim, dtype=np.intp)
+        for d in range(self.dim):
+            knots_d = self.knots[d]
+            point_d = point[d]
+            if point_d>knots_d[-1] or point_d<knots_d[0]:
+                return None
+            idx = np.searchsorted(knots_d, point_d, side='right')-1
+            indices[d] = idx
+        
+        shape = [len(k)-1 for k in self.knots]
+        if self.dim==1:
+            return indices[0]
+        if self.dim==2:
+            return indices[1]*shape[0]+indices[0]
+        if self.dim==3:
+            return (indices[2] * shape[1] * shape[0]) + (indices[0] * shape[1]) + indices[1]
     
     def get_neighbours(self, indices: np.ndarray):
         """
