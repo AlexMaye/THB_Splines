@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Union, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -7,34 +7,136 @@ from THBSplines.src_c.BSpline import TensorProductBSpline
 from THBSplines.src.abstract_space import Space
 from THBSplines.src.b_spline import augment_knots, find_knot_index
 from THBSplines.src.cartesian_mesh import CartesianMesh
-from scipy.interpolate import NdBSpline
+from numba import jit
+
+#@jit(nopython=True)
+def _bezier_extraction_impl(p: int, knots: np.ndarray)->np.ndarray:
+
+    #p = self.degree
+    #knots = self.knots
+    
+    uniquekn = np.unique(knots)
+    m=len(knots)
+    a=p+1
+    b=a+1
+    nb = 1
+    num_elements = len(uniquekn) - 1
+    # Create 3d array with identity matrix for each entry
+    C = np.zeros((num_elements, p + 1, p + 1))
+    for i in range(num_elements): #for numba
+        C[i] = np.eye(p + 1, dtype=np.float64)
+    #C = np.repeat(np.identity(p+1, dtype=np.float64)[None, ...], len(uniquekn)-1, axis=0)
+    #C = np.array([np.eye(p+1, dtype=np.float64) for _ in range(len(uniquekn)-1)])
+    while b<m:
+        i=b
+        while b<m and knots[b]==knots[b-1]: #needed for break condition
+            b+=1
+        mult=b-i+1
+        if mult<p:
+            numer = knots[b-1]-knots[a-1]
+            # alphas = np.zeros((p-mult, ))
+            knots2 = knots[a-1]
+            knots1 = knots[a+mult:a+p]
+            denom = knots1-knots2
+            alphas = numer/denom
+            r=p-mult
+            for j in range(1, r+1):
+                save=r-j+1
+                s=mult+j
+                this_alphas = alphas[:p-s+1]
+                #C[nb-1, :, s:p+1] = this_alphas*C[nb-1, :, s:p+1] + (1.-this_alphas)*C[nb-1, :, s-1:p]
+                for row in range(p+1): #for numba
+                    C[nb-1, row, s:p+1] = this_alphas*C[nb-1, row, s:p+1] + (1.-this_alphas)*C[nb-1, row, s-1:p]
+                pass
+                if b<m:
+                    C[nb, save-1:j+save, save-1]=C[nb-1, p-j:p+1, p]
+                pass
+            pass
+        pass
+        nb+=1
+        if b<m:
+            a=b
+            b+=1
+        pass
+    pass
+    return C
 
 class UnivariateSplineSpace(Space):
     """
     Attributes
     --------------
-    - degree
-    - knots
-    - nfuncs
+    - degree: int
+        degree of the BSplines 
+
+    - knots: np.ndarray
+        knots associated to the BSplines, with the provided multiplicities.
+    
+    - nfuncs: int
+        number of functions associated to these knots and degree
+
+    - unique_knots: np.ndarray
+        knots without the multiplicity
+
+    - knot_to_unique: np.ndarray
+        array to find back `self.knots` for `self.unique_knots(return_inverse=True)`. See `np.unique` for more detail
+    
+    - n_cells: int
+        number of cells in this space
+
+    - cell_to_last_knot: np.ndarray
+
+    - grid_indices: np.ndarray(n_funcsx(degree+1), dtype=np.uintp)
+        knots indices that hold each basis function
+
+    - local_knots: np.ndarray(nfuncsx(degree+1), dtype=np.float64)
+        knots values that hold each basis function
+
+    - supports: np.ndarray(nfuncsx2, dtype=np.float64)
+        each basis function support interval's boundaries
+
+    - end_evals: np.ndarray(nfuncs)
+        value of each basis function at the end of its support
+
+    - Rs: np.ndarray(n_cellsx(degree+1)x(degree+1), dtype=np.float64)
+        local multi-level extraction operators to go from `self.knots` to their dyadic refinement.
+    
+    - bezier: np.ndarray(n_cellsx(degree+1)x(degree+1), dtype=np.float64)
+        local bezier extraction matrices
+
+
 
     Methods
     ------------
-    - bezier_extraction_operator()
-    - knot_insertion_operator()
-    - get_support()
+    - cell_to_basis_indices(cell_indices)->np.ndarray:
+        returns the indices of basis functions supported over the given cell indices
+    
+    - basis_to_cell_indices(basis_indices)->list[np.array(dtype=np.uintp)]:
+        returns the indices of the cells who make the support of the given basis.
+        This function returns a list of arrays since all basis do not have the same amount of 
+        cells in their support
+
+    - refine(knots, p)->np.ndarray:
+        given `knots` and a degree `p`, computes the dyadic refinement of the knots with 
+        respect to `p`. Boundary multiplicities are handled automatically.
+
     """
 
     def __init__(self, degree: int, knots: np.ndarray):
         self.degree = degree
         self.knots = np.sort(knots)
         uniquekn, mults = np.unique(self.knots, return_counts=True)
+        p1 = self.degree+1
         assert np.all(np.diff(uniquekn)==np.diff(uniquekn)[0]), "Only equally spaced knots are supported."
-        if mults[0]<self.degree+1:
-            self.knots = np.append(self.knots[0]*np.ones(self.degree+1-mults[0]), self.knots)
-        if mults[-1]<self.degree+1:
-            self.knots = np.append(self.knots, self.knots[-1]*np.ones(self.degree+1-mults[-1]))
+        if mults[0]<p1:
+            self.knots = np.append(self.knots[0]*np.ones(p1-mults[0], dtype=self.knots.dtype), self.knots)
+        elif mults[0]>p1:
+            self.knots = np.delete(self.knots, np.arange(mults[0]-p1))
+        if mults[-1]<p1:
+            self.knots = np.append(self.knots, self.knots[-1]*np.ones(p1-mults[-1], dtype=self.knots.dtype))
+        elif mults[-1]>self.degree+1:
+            self.knots = np.delete(self.knots, np.arange(len(self.knots)-1, len(self.knots)-mults[-1]+p1-1, -1))
 
-        self.nfuncs = len(knots)-degree-1
+        self.nfuncs = len(self.knots)-p1
         self.unique_knots, self.knot_to_unique = np.unique(self.knots, return_inverse=True)
         self.n_cells = len(self.unique_knots)-1
         left_boundaries = self.unique_knots[:-1]
@@ -44,10 +146,10 @@ class UnivariateSplineSpace(Space):
          # --- 1D Basis Construction ---
         
         # 1. Starting indices for each basis function: [0, 1, ..., nfuncs-1]
-        starts = np.arange(self.nfuncs)
+        starts = np.arange(self.nfuncs, dtype=np.uintp)
         
         # 2. Local knots for each basis function: shape (nfuncs, p+2)
-        offsets = np.arange(self.degree + 2)
+        offsets = np.arange(p1+1, dtype=np.uintp)
         self.grid_indices = starts[:, None] + offsets[None, :]
         # coordinates of supported knots (e.g [[-0.5, -0.5, -0.5, -0.25], ...])
         self.local_knots = self.knots[self.grid_indices]
@@ -57,9 +159,9 @@ class UnivariateSplineSpace(Space):
         
         # 4. End evaluations (touches the very last knot): shape (nfuncs,)
         # Equivalent to your: is_at_end = idx_stop_perm[:, j] == len(self.knots[j])
-        self.end_evals = (starts + self.degree + 2) == len(self.knots)
+        self.end_evals = (starts + p1+1) == len(self.knots)
 
-        self.Rs, self.e = self.element_knot_insertion_operator()
+        self.Rs, _ = self.element_knot_insertion_operator()
         self.bezier = self.bezier_extraction_operator()
 
     def cell_to_basis(self, cell_indices):
@@ -79,7 +181,7 @@ class UnivariateSplineSpace(Space):
         j = self.cell_to_last_knot[cell_indices]
         
         # offsets has shape (p+1,) -> [-p, -p+1, ..., 0]
-        offsets = np.arange(-self.degree, 1)
+        offsets = np.arange(-self.degree, 1, dtype=j.dtype)
         
         # Broadcasting: (N, 1) + (1, p+1) -> shape (N, p+1)
         basis_idx = j[:, None] + offsets[None, :]
@@ -93,6 +195,7 @@ class UnivariateSplineSpace(Space):
         # Basis 'i' is defined by the knot span [u_i, u_{i+p+1}]
         basis_indices = np.atleast_1d(basis_indices)
         assert np.max(basis_indices)<self.nfuncs, "The space does not have as many functions."
+        assert np.min(basis_indices)>=0, "Indices must be non-negative."
         start_knot_idxs = basis_indices
         end_knot_idxs = basis_indices + self.degree + 1
         
@@ -101,64 +204,25 @@ class UnivariateSplineSpace(Space):
         end_cells = self.knot_to_unique[end_knot_idxs]
 
         if len(basis_indices)==1:
-            return [np.arange(start_cells, end_cells)]
+            return [np.arange(start_cells, end_cells, dtype=np.uintp)]
         
         # Return the range of cells
         # A list comprehension is necessary since BSplines do not span over the same amount of cells
-        return [np.arange(start_cells[i], end_cells[i]) for i in range(len(basis_indices))]
-
-    def bezier_extraction_operator(self)->np.ndarray:
-
-        p = self.degree
-        knots = self.knots
-        
-        _, mults = np.unique(knots, return_counts=True)
+        return [np.arange(start_cells[i], end_cells[i], dtype=np.uintp) for i in range(len(basis_indices))]
     
-        m=len(knots)
-        a=p+1
-        b=a+1
-        nb = 1
-        C = np.array([np.eye(p+1, dtype=float) for _ in range(len(mults)-1)])
-        while b<m:
-            i=b
-            while b<m and knots[b]==knots[b-1]: #needed for break condition
-                b+=1
-            mult=b-i+1
-            if mult<p:
-                numer = knots[b-1]-knots[a-1]
-                alphas = np.zeros((p-mult, ), dtype=float)
-                knots2 = knots[a-1]
-                knots1 = knots[a+mult:a+p]
-                denom = knots1-knots2
-                alphas = numer/denom
-                r=p-mult
-                for j in range(1, r+1):
-                    save=r-j+1
-                    s=mult+j
-                    this_alphas = alphas[:p-s+1]
-                    C[nb-1, :, s:p+1] = this_alphas*C[nb-1, :, s:p+1] + (1.-this_alphas)*C[nb-1, :, s-1:p]
-                    
-                    if b<m:
-                        C[nb, save-1:j+save, save-1]=C[nb-1, p-j:p+1, p]
-                    pass
-                pass
-            pass
-            nb+=1
-            if b<m:
-                a=b
-                b+=1
-            pass
-        pass
-        return C
+    def bezier_extraction_operator(self) -> np.ndarray:
+        # Pass only the raw data (int and numpy array) to the JIT function
+        return _bezier_extraction_impl(self.degree, self.knots)
     
     @staticmethod
+    # @jit(nopython=True)
     def _oslo1(p: int, coarsekn: np.ndarray, finekn: np.ndarray, cf: int, rf: int)->np.ndarray:
         if cf >= len(coarsekn) - 1:
             return np.zeros(p + 1)
 
         if not (coarsekn[cf] <= finekn[rf] < coarsekn[cf+1]):
             return np.zeros(p + 1)
-        b = np.zeros((p+1))
+        b = np.zeros(p+1)
         b_temp = np.zeros_like(b)
         b[0]=1.
         for k in range(p):
@@ -166,9 +230,12 @@ class UnivariateSplineSpace(Space):
             t2 = coarsekn[cf+1:cf+k+2]
             denom = t2-t1
             x = finekn[rf+k+1]
-            with np.errstate(divide='ignore', invalid='ignore'):
-                w = (x - t1) / denom
-                w = np.nan_to_num(w)
+            w = np.zeros(len(t1))
+            mask = np.abs(denom)>1e-10
+            w[mask] = (x-t1)[mask]/denom[mask]
+            # with np.errstate(divide='ignore', invalid='ignore'):
+            #     w = (x - t1) / denom
+            #     w = np.nan_to_num(w)
             b_temp[:k+1] = (1.-w)*b[:k+1]
             b_temp[1:k+2] = b_temp[1:k+2] + w*b[:k+1]
             b[:k+2] = b_temp[:k+2]
@@ -187,7 +254,7 @@ class UnivariateSplineSpace(Space):
         if mults[-1]!=p+1:
             q2=p+1-mults[-1]
         refined_knots = (unique_knots[1:]+unique_knots[:-1])/2.
-        return np.hstack((unique_knots[0]*np.ones(q1), np.hstack((np.sort(np.hstack((knots,refined_knots))), unique_knots[-1]*np.ones(q2)))))
+        return np.hstack((unique_knots[0]*np.ones(q1, dtype=unique_knots.dtype), np.hstack((np.sort(np.hstack((knots,refined_knots))), unique_knots[-1]*np.ones(q2, dtype=unique_knots.dtype)))))
         
     def element_knot_insertion_operator(self, coarsekn: np.ndarray=None)->np.ndarray:
         """
@@ -198,32 +265,29 @@ class UnivariateSplineSpace(Space):
         p = self.degree
         coarsekn = self.knots if coarsekn is None else coarsekn
         finekn = self.refine(coarsekn, p)
-        _, fine_mults = np.unique(finekn, return_counts=True)
-        #assert mults[0]==mults[-1]==fine_mults[0]==fine_mults[-1]==p+1, 'Incorrect boundary mults'
-        # assert self.check_subspace_property(coarse_knots=coarsekn, fine_knots=finekn), 'Subspace property not verified'
+        uniquekn = np.unique(finekn)
         
         m = len(finekn)
         assert m>len(coarsekn), "finekn is not finer than coarsekn"
         rf = 0
         e = 0
         #_, mults = np.unique(finekn, return_counts=True)
-        R = np.zeros((len(fine_mults)-1, p+1, p+1), dtype=float)
+        R = np.zeros((len(uniquekn)-1, p+1, p+1))
         all_cfs = np.searchsorted(coarsekn, finekn, side='right') - 1
         
         max_cf = len(coarsekn) - 2 
         all_cfs = np.clip(all_cfs, p, max_cf)[:m-p-1]
         cf = all_cfs[p] 
         while rf<m-p-1:
-            # mult = 1
-            # while ((rf+mult<m)and(finekn[rf+mult] == finekn[rf])):
-            #     mult+=1
-            mult = fine_mults[e].astype(int)
+            mult = 1
+            while ((rf+mult<m)and(finekn[rf+mult] == finekn[rf])):
+                mult+=1
+            #mult = fine_mults[e].astype(int)
             lastcf = cf
             # while cf+2<len(coarsekn) and coarsekn[cf+1]<=finekn[rf]:
             #     cf+=1
             cf = all_cfs[rf] 
             
-            #Re = np.zeros((p+1, p+1), dtype=float)
             if e>0:
                 offs = cf-lastcf
                 rows_prev = slice(offs, p + 1)
@@ -272,7 +336,7 @@ class UnivariateSplineSpace(Space):
         rfs = range(rf1, rf1+p+1) # Each interval supports p+1 basis functions
         cfs = np.searchsorted(coarsekn, finekn[rfs], 'right') -1 # Find starting point of coarse interval corresponding to starting point of each fine function.
         a = p+1 - (np.max(cfs) - cfs) # Determine how many elements from oslo to take and how to put them into the matrix
-        M = np.zeros((p+1, p+1), dtype=float) #Prepare output matrix
+        M = np.zeros((p+1, p+1), dtype=np.float64) #Prepare output matrix
         for i in range(p+1):
             weights = self._oslo1(p, coarsekn=coarsekn, finekn=finekn, cf=cfs[i], rf=rfs[i])
             M[:a[i], i] = weights[p+1-a[i]:]
@@ -350,42 +414,57 @@ class TensorProductSpace(Space):
     ---------
     dim: int 
         the number of parametric dimensions
+
     mesh: CartesianMesh
         underlying mesh
+
     spaces: list[UnivariateSplineSpace]
-    nfuncs: int 
-        number of functions in `basis`.
-    basis_supports: np.ndarray(nfuncs x dim x 2)
-        the support of each function in AABB format 
-    basis: np.ndarray(nfuncs x dim x p+2)
-        the knots that define the support of each function. Knots 
-        are repeated if passed so.
-    basis_end_evals: np.ndarray(nfuncs x dim)
-        Evaluation of basis functions at the end of their cells
-    nfuncs_onedim: list
-        number of functions per dimension
-    cell_areas: np.ndarray
-        area of each cell
+        holds the knots of each dimension and 1D information about the corresponding BSplines.
+
+    nfuncs_onedim: list[int]
+        number of functions in each space
+
+    nfuncs_total: int
+        number of function in the current TensorProductSpace
+
+    cell_supports: np.ndarray(np.ndarray, dtype=np.uintp), dtype=object)
+        For each basis function, holds its support cells. Since each basis function 
+        does not have the same amount of support cells, this array cannot have a fixed
+        width.
+
+    basis_indices_supports = np.ndarray((#cells)x(#supported_functions), dtype=np.uintp)
+        row j contains the indices of basis functions whose support includes cell j
+
+    refinement_operators: list[scipy.sparse.bsr_array]
+        holds the kronecker products of local multi-level refinement operators of the 1D spaces.
+
+        
     Methods
     ---------
     cell_to_basis(cell_indices):
         Returns the indices of basis-functions active on the corresponding cells.
+    
     basis_to_cell(basis_indices):
         Returns the indices of cells in the support of the passed basis
+    
     get_cells(basis_function_list):
         Given a list of basis function indices, returns the support for each basis
         function as well as a dictionary mapping the basis function indices
         to the corresponding cell indices.
+    
     construct_basis():
         Initializes the tensor product space by (implicitly) creating all the BSplines and
         setting their support as intervals [[[a_1^1, a_1^2], ..., [a_1^d, a_2^d]], ..., [[a_n^1, a_n^2], ..., [a_n^d, a_n^d]]]
         and with respect to the knots.
+    
     refine():
         dyadic refinement of the current knots. Returns a new TensorProductSpace
         and the projection matrix to go from one space to the other.
+    
     bezier_extraction_operator():
         For each dimension, computes the local Bézier extraction operators.
         The result is saved in a new attribute `self.bezier_extraction_operators`.
+    
     element_knot_insertion_operators():
         For each dimension, computes local extraction operators for current knots to the next refinement level.
         The result is saved in a new attribute `self.insertion_operators`.
@@ -393,15 +472,9 @@ class TensorProductSpace(Space):
     get_element_extraction_matrix(element_idx, p, coarsekn, finekn):
         Constructs the (p+1)x(p+1) matrix M for a specific fine element 'e' such that:
         N_coarse_local(u) = M @ N_fine_local(u).
-    get_cells(basis_function_list):
-        Given a list of indices corresponding to basis functions, return the
-        union of the support-cells, and a dictionary mapping basis_function
-        to cell index.
-    construct_function(coefficients):
-        constructs the spline using the basis and the provided coefficients.
-    get_function_on_rectangle(rectangle):
-        Returns the indices of the functions whose support contains the
-        rectangle.
+    
+    
+    
     """
 
     def __init__(self, dim: int, univariate_spaces: list[UnivariateSplineSpace]):
@@ -421,7 +494,8 @@ class TensorProductSpace(Space):
         self.nfuncs_onedim = [space.nfuncs for space in self.spaces]
         self.nfuncs_total = np.prod(self.nfuncs_onedim)
         self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
-        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total)), dtype=object)
+        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.uintp)), dtype=object)
+        self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.uintp))
         refinement_operators = []
         if self.dim==1:
             self.refinement_operators = [sp.bsr_array(self.spaces[0].Rs[i], 
@@ -465,7 +539,7 @@ class TensorProductSpace(Space):
         """
         if len(basis_indices)==0:
             print('No basis list was provided in basis_to_cell.')
-            return np.array([], dtype=int)
+            return np.array([], dtype=np.uintp)
         
         #grid_shape = self.mesh.shape
         tensor_idx = np.unravel_index(basis_indices, self.nfuncs_onedim)
@@ -487,8 +561,16 @@ class TensorProductSpace(Space):
             nd_cells_list.append(flat_cells.ravel())
             
         return nd_cells_list
+    
+    def cell_to_basis(self, cell_indices)->np.ndarray:
+        """Returns the indices of the function supported in the given list of cells.
+        The "inverse" of basis_to_cell.
+        
+        :param cell_indices: a int/list/array of indices
+        """
+        return self.basis_indices_supports[cell_indices]
 
-    def cell_to_basis(self, cell_list: np.ndarray) -> np.ndarray:
+    def _cell_to_basis(self, cell_list: np.ndarray) -> np.ndarray:
         """
         Returns the indices of basis functions supported over the given list of cells.
         A basis function is returned if its support contains a cell in `cell_list`.
@@ -499,7 +581,7 @@ class TensorProductSpace(Space):
         cell_list = np.atleast_1d(cell_list)
         if len(cell_list) == 0:
             print('No cell list was provided in cell_to_basis().')
-            return np.array([], dtype=int)
+            return np.array([], dtype=np.uintp)
         
         grid_shape: tuple[int]=self.mesh.shape
 
@@ -522,9 +604,9 @@ class TensorProductSpace(Space):
             dims=self.nfuncs_onedim,
             mode='raise'
         )
-        
+        return flat_basis_nd.reshape(len(cell_list), -1).astype(np.uintp)
         # 4. Flatten the array and return unique basis indices
-        return np.unique(flat_basis_nd)
+        #return np.unique(flat_basis_nd)
 
     def construct_basis(self):
         """
@@ -548,7 +630,7 @@ class TensorProductSpace(Space):
         >>> self.basis_end_evals
         [array([0], dtype=int32), array([0], dtype=int32), array([0], dtype=int32), array([0], dtype=int32), array([1], dtype=int32)]
         """
-        basis_function_list = range(self.nfuncs_total)
+        basis_function_list = np.arange(self.nfuncs_total, dtype=np.uintp)
         tensor_idx = np.unravel_index(basis_function_list, self.nfuncs_onedim)
         basis_supports=[]
         basis=[]
@@ -557,7 +639,7 @@ class TensorProductSpace(Space):
             supports_d = current_space.supports[tensor_idx[d]]
             basis_supports.append(supports_d)
 
-            basis_d = current_space.knots[np.arange(current_space.nfuncs)[:, None] + np.arange(current_space.degree+2)]
+            basis_d = current_space.knots[np.arange(current_space.nfuncs, dtype=np.uintp)[:, None] + np.arange(current_space.degree+2, dtype=np.uintp)]
             basis.append(basis_d[tensor_idx[d]])
         pass
         self.basis_supports = np.stack(basis_supports, axis=1)
