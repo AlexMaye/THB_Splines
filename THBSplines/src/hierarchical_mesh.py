@@ -74,8 +74,8 @@ class HierarchicalMesh(Mesh):
         self._aelem_level_set = {0: set(range(self.meshes[0].nelems))}  # active elements on level
         self._delem_level_set = {0: set()}  # deactivated elements on level
 
-        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=int)}
-        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=int)}
+        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=np.uintp)}
+        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=np.uintp)}
         self.nel_per_level = {0: self.meshes[0].nelems}
 
         self.cell_area_per_level = {0: self.meshes[0].cell_areas}
@@ -89,7 +89,7 @@ class HierarchicalMesh(Mesh):
         """
         coarse_level=self.nlevels-1
         fine_level=self.nlevels
-        coarse_mesh = self.meshes[-1] #CartesianMesh
+        coarse_mesh: CartesianMesh = self.meshes[-1]
         fine_mesh = coarse_mesh.refine() # refine method of CartesianMesh
         self.meshes.append(fine_mesh)
         self.nlevels += 1
@@ -97,8 +97,8 @@ class HierarchicalMesh(Mesh):
         # Initialise new attributes
         self._aelem_level_set[fine_level] = set()
         self._delem_level_set[fine_level] = set()
-        self.aelem_level[fine_level] = np.array([], dtype=int)
-        self.delem_level[fine_level] = np.array([], dtype=int)
+        self.aelem_level[fine_level] = np.array([], dtype=np.uintp)
+        self.delem_level[fine_level] = np.array([], dtype=np.uintp)
         self.nel_per_level[fine_level]=0
         self.cell_area_per_level[fine_level] = fine_mesh.cell_areas
 
@@ -173,8 +173,8 @@ class HierarchicalMesh(Mesh):
         self._update_active_cells(marked_cells, at_level=at_level)
         self.nel=0
         for l in range(self.nlevels):
-            self.aelem_level[l] = np.array(sorted(list(self._aelem_level_set[l])), dtype=int)
-            self.delem_level[l] = np.array(sorted(list(self._delem_level_set[l])), dtype=int)
+            self.aelem_level[l] = np.array(sorted(list(self._aelem_level_set[l])), dtype=self.aelem_level[0].dtype)
+            self.delem_level[l] = np.array(sorted(list(self._delem_level_set[l])), dtype=self.aelem_level[0].dtype)
             self.nel_per_level[l] = len(self.aelem_level[l])
             self.nel += self.nel_per_level[l]
         pass
@@ -258,9 +258,9 @@ class HierarchicalMesh(Mesh):
             pass
         pass
 
-        return np.array(coarse_cells, dtype=int), np.array(indices, dtype=int)
+        return np.array(coarse_cells, dtype=np.uintp), np.array(indices, dtype=np.uintp)
     
-    def get_parent(self, level:int, marked_cells_at_level: np.ndarray) -> np.ndarray:
+    def get_parent(self, level:int, marked_cells_at_level: np.ndarray, skip_assert=False) -> np.ndarray:
         """
         For given level l and marked cells {Q_i^l}, returns coarse cells {Q_k^{l-1}| there exists k such that Q_i^l⊆Q_k^{l-1}}
 
@@ -273,18 +273,20 @@ class HierarchicalMesh(Mesh):
         --------------------
         - indices: parent global at level `level-1`.
         """
-        assert level>0, "Parents of cells at level 0 do not exist"
-        assert np.max(marked_cells_at_level)<len(self.nodes[level]), "There aren't as many cells at that level."
-        assert np.min(marked_cells_at_level)>=0, "Cells indices cannot be negative."
+        if not skip_assert:
+            assert level>0, "Parents of cells at level 0 do not exist"
+            assert np.max(marked_cells_at_level)<len(self.nodes[level]), "There aren't as many cells at that level."
+            assert np.min(marked_cells_at_level)>=0, "Cells indices cannot be negative."
+
         marked_cells_at_level = np.atleast_1d(marked_cells_at_level)
         if len(marked_cells_at_level)==1:
             return self.nodes[level][marked_cells_at_level[0]].parent.index
 
-        indices = np.empty_like(marked_cells_at_level)
+        level_nodes = self.nodes[level]
+        indices = np.empty(len(marked_cells_at_level), dtype=level_nodes[0].index.dtype)
         for i, idx in enumerate(marked_cells_at_level):
-            node: CellNode = self.nodes[level][idx]
+            node: CellNode = level_nodes[idx]
             parent_node: CellNode = node.parent
-            #fine_cells.append(idx)
             indices[i] = parent_node.index
         pass
         return indices
@@ -297,7 +299,7 @@ class HierarchicalMesh(Mesh):
         if stop_level==start_level:
             return np.squeeze(marked_cells_at_start_level)
         if stop_level==start_level-1:
-            return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level)
+            return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         
         marked_cells_at_start_level = np.atleast_1d(marked_cells_at_start_level)
 
@@ -309,11 +311,49 @@ class HierarchicalMesh(Mesh):
             return parent_node.index
         
         for level in range(start_level, stop_level, -1):
-            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level)
+            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         return marked_cells_at_start_level
+    
+    def _is_point_in_cell_geometry(self, node, point):
+        """Checks if a point is inside the bounding box of a specific node."""
+        # Retrieve the cell's AABB: shape (dim, 2) -> [[min_x, max_x], [min_y, max_y]...]
+        cell_bounds = np.atleast_2d(self.meshes[node.level].cells[node.index])
+        
+        eps = np.spacing(1.) # Tolerance for floating point boundaries
+        for d in range(self.dim):
+            c_min, c_max = cell_bounds[d]
+            if not (point[d] >= c_min - eps and point[d] <= c_max + eps):
+                return False
+            pass
+        pass
+
+        return True
 
             
+    def find_active_cell(self, point: np.ndarray)->int:
+        """Given `point`, returns the finest cell that contains it."""
+        point = np.atleast_1d(point)
+        l0_index = self.meshes[0].find_index(point)
+    
+        if l0_index is None:
+            return None #point is outside the mesh domain
+        pass
 
+        current_node = self.nodes[0][l0_index]
+        while not current_node.is_active:
+            found_in_child = False
+            for child in current_node.children:
+                if self._is_point_in_cell_geometry(child, point):
+                    current_node = child
+                    found_in_child = True
+                    break
+                pass
+            pass
+            if not found_in_child:
+                return None
+            pass
+        pass
+        return (current_node.level, current_node.index)
     
     def refine_in_rectangle(self, rect, level: int):
         """
