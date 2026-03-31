@@ -28,13 +28,13 @@ class HierarchicalSpace(Space):
         univariate_spline_spaces = [UnivariateSplineSpace(degree=self.degrees[d], knots=knots[d]) for d in range(self.dim)]
         self.level_spaces: dict[int, TensorProductSpace] = {0: TensorProductSpace(dim=self.dim, univariate_spaces=univariate_spline_spaces)}
         self.nlevels = 1
-        self.active_functions: dict[int, np.ndarray] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.uintp)}
-        self.deactivated_functions: dict[int, np.ndarray] = {0: np.array([], dtype=np.uintp)}
+        self.active_functions: dict[int, np.ndarray] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.int32)}
+        self.deactivated_functions: dict[int, np.ndarray] = {0: np.array([], dtype=np.int32)}
         # Functions of level l that are supported on \Omega^l_{-}
-        self.Bl_minus: dict[int, np.ndarray] = {0: np.array([], dtype=np.uintp)}
+        self.Bl_minus: dict[int, np.ndarray] = {0: np.array([], dtype=np.int32)}
         l0_space = self.level_spaces[0]
         n_funcs0 = l0_space.nfuncs_total
-        self.active_cell_counts: dict[int, np.ndarray] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.uintp)}
+        self.active_cell_counts: dict[int, np.ndarray] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.int32)}
 
         self.refinement_operators: dict[int, np.ndarray] = {0: self.level_spaces[0].refinement_operators}
         self.bezier_operators: dict[int, np.ndarray] = {0: [uni_spline_space.bezier for uni_spline_space in univariate_spline_spaces]}
@@ -194,7 +194,7 @@ class HierarchicalSpace(Space):
                     pass
                 pass
             
-                all_indices = np.arange(nfuncs, dtype=np.uintp)
+                all_indices = np.arange(nfuncs, dtype=np.int32)
 
                 self.active_functions[l] = all_indices[is_active_mask]
                 self.deactivated_functions[l]=all_indices[~is_active_mask]
@@ -347,7 +347,7 @@ class HierarchicalSpace(Space):
         if not np.any(rows_to_keep):
             return sp.csr_array((0,my_size), dtype=np.float64)
         
-        rows_to_keep_sparse = np.arange(my_size, dtype=np.uintp)[rows_to_keep]
+        rows_to_keep_sparse = np.arange(my_size, dtype=np.int32)[rows_to_keep]
         return sp.diags_array(np.ones(my_size), offsets=np.min(rows_to_keep_sparse), shape=(len(rows_to_keep_sparse), my_size), dtype=np.float64, format='csr')
     
     def local_multi_level_extraction_operator(self, element_idx: int, element_level: int, l: int):
@@ -406,12 +406,86 @@ class HierarchicalSpace(Space):
         pass
         return global_indices
     
+    def get_all_active_functions_on_cell(self, level: int, cell_idx: int)->dict:
+        """Given a cell at `level`, returns functions from all levels that are active on it.
+        
+        Returns
+        ------------
+        - dict[int, np.ndarray]: all active functions with their respective levels as the keys.
+        - dict[int, np.ndarray]: all functions that have support on this cell, whether they are active or not.
+        """
+        assert self.mesh.nodes[level][cell_idx].is_active, "Provided cell is inactive."
+        functions = self.level_spaces[level].cell_to_basis(cell_idx)
+        functions_on_cell: np.ndarray = np.intersect1d(functions, self.active_functions[level], assume_unique=True)
+        active_functions_l = dict(level, np.setdiff1d(functions_on_cell, self.Bl_minus[level], assume_unique=True))
+        all_functions = dict(level, functions)
+        parent_cell = cell_idx
+        for l in range(level, 0, -1): #everything in the loop happens for cells of level l-1, therefore the last iteration needs to happen for l=1
+            # Get parent cell of level `level-1`
+            parent_cell = self.mesh.get_parent(level=l, marked_cells_at_level=parent_cell)[0]
+            functions = self.level_spaces[level-1].cell_to_basis(parent_cell)
+            functions_on_cell = np.intersect1d(functions, self.active_functions[l-1], assume_unique=True)
+            active_functions_l[level-1] = np.setdiff1d(functions_on_cell, self.Bl_minus[level-1], assume_unique=True)
+            all_functions[level-1] = functions
+        return active_functions_l, all_functions
     
+    def evaluate_thb_spline(self, x_eval, coefficients: np.ndarray):
+        """evaluate the THB splines on the current mesh at point `x_eval` with coefficients `c`. """
+        level, cell_idx = self.mesh.find_active_cell(x_eval)
+        active_functions, all_functions = self.get_all_active_functions_on_cell(level, cell_idx=cell_idx)
+        function_still_active = {}
+        for l in range(level+1):
+            function_still_active[l] = np.isin(active_functions[l], all_functions[l], assume_unique=True)
+        
+    def _legendre_to_bezier(self, degree: int):
+        from scipy.special import comb
+        n = degree
+        indices = np.arange(n + 1, dtype=np.intp)
+        
+        # G[j, i] = comb(j, i)
+        G = comb(indices[:, None], indices[None, :])
+        
+        # F[i, k] = (-1)**(k+i) * comb(k, i) * comb(k+i, i) / comb(n, i)
+        I = indices[:, None]
+        K = indices[None, :]
+        F = ((-1)**(K + I)) * comb(K, I) * comb(K + I, I) / comb(n, I)
+        
+        return G @ F
     
-    def evaluate_thb_spline(self, x_eval, c: np.ndarray):
-        """evaluate the THB splines on the current mesh at point `x_eval` with 
-        coefficients `c`. """
-        # active_functions = 
+    def _bezier_to_legendre(self, degree: int):
+        from scipy.special import comb
+        n = degree+1
+        js = np.arange(n)
+        ks = np.arange(n)
+        i_vals = np.arange(n)
+
+        # lefts[j] = (2j+1) / ((n+j) * comb(n-1+j, n-1))
+        lefts = (2 * js + 1) / ((n + js) * comb(degree + js, degree))
+
+        J = js[:, np.newaxis, np.newaxis]
+        K = ks[np.newaxis, :, np.newaxis]
+        I = i_vals[np.newaxis, np.newaxis, :]
+
+        # Mask to handle the i <= j constraint
+        mask = (I <= J)
+        sign = (-1.0)**(J - I)
+      
+        c1 = comb(J, I)
+        
+        c2 = comb(K + I, K)
+        
+        c3 = comb(degree - K + J - I, degree - K)
+
+        # Multiply and sum over the I axis 
+        # The mask ensures terms where i > j are zeroed out
+        inner_sum = np.sum(sign * c1 * c2 * c3 * mask, axis=2)
+
+        M = lefts[:, np.newaxis] * inner_sum
+
+        return M
+
+
+
         # c_local_thb = c[]
 
         

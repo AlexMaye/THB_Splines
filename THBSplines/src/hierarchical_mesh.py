@@ -74,8 +74,8 @@ class HierarchicalMesh(Mesh):
         self._aelem_level_set = {0: set(range(self.meshes[0].nelems))}  # active elements on level
         self._delem_level_set = {0: set()}  # deactivated elements on level
 
-        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=np.uintp)}
-        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=np.uintp)}
+        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=np.int32)}
+        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=np.int32)}
         self.nel_per_level = {0: self.meshes[0].nelems}
 
         self.cell_area_per_level = {0: self.meshes[0].cell_areas}
@@ -97,8 +97,8 @@ class HierarchicalMesh(Mesh):
         # Initialise new attributes
         self._aelem_level_set[fine_level] = set()
         self._delem_level_set[fine_level] = set()
-        self.aelem_level[fine_level] = np.array([], dtype=np.uintp)
-        self.delem_level[fine_level] = np.array([], dtype=np.uintp)
+        self.aelem_level[fine_level] = np.array([], dtype=np.int32)
+        self.delem_level[fine_level] = np.array([], dtype=np.int32)
         self.nel_per_level[fine_level]=0
         self.cell_area_per_level[fine_level] = fine_mesh.cell_areas
 
@@ -258,7 +258,7 @@ class HierarchicalMesh(Mesh):
             pass
         pass
 
-        return np.array(coarse_cells, dtype=np.uintp), np.array(indices, dtype=np.uintp)
+        return np.array(coarse_cells, dtype=np.int32), np.array(indices, dtype=np.int32)
     
     def get_parent(self, level:int, marked_cells_at_level: np.ndarray, skip_assert=False) -> np.ndarray:
         """
@@ -271,7 +271,7 @@ class HierarchicalMesh(Mesh):
 
         Returns
         --------------------
-        - indices: parent global at level `level-1`.
+        - indices: np.ndarray(int) parent global at level `level-1`.
         """
         if not skip_assert:
             assert level>0, "Parents of cells at level 0 do not exist"
@@ -330,8 +330,14 @@ class HierarchicalMesh(Mesh):
         return True
 
             
-    def find_active_cell(self, point: np.ndarray)->int:
-        """Given `point`, returns the finest cell that contains it."""
+    def find_active_cell(self, point: np.ndarray)->tuple[int, int]:
+        """Given `point`, returns the level and the finest cell that contains it.
+        
+        Returns
+        ---------------
+        - (level, cell_index), the level of the finest active cell containing `point` and its index 
+        in that level.
+        """
         point = np.atleast_1d(point)
         l0_index = self.meshes[0].find_index(point)
     

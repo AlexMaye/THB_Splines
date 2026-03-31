@@ -3,7 +3,8 @@ from typing import List, Tuple
 
 import numpy as np
 import scipy.sparse as sp
-from THBSplines.src_c.BSpline import TensorProductBSpline
+from scipy.interpolate import BSpline
+# from THBSplines.src_c.BSpline import TensorProductBSpline
 from THBSplines.src.abstract_space import Space
 from THBSplines.src.b_spline import augment_knots, find_knot_index
 from THBSplines.src.cartesian_mesh import CartesianMesh
@@ -85,7 +86,7 @@ class UnivariateSplineSpace(Space):
 
     - cell_to_last_knot: np.ndarray
 
-    - grid_indices: np.ndarray(n_funcsx(degree+1), dtype=np.uintp)
+    - grid_indices: np.ndarray(n_funcsx(degree+1), dtype=np.int32)
         knots indices that hold each basis function
 
     - local_knots: np.ndarray(nfuncsx(degree+1), dtype=np.float64)
@@ -110,7 +111,7 @@ class UnivariateSplineSpace(Space):
     - cell_to_basis_indices(cell_indices)->np.ndarray:
         returns the indices of basis functions supported over the given cell indices
     
-    - basis_to_cell_indices(basis_indices)->list[np.array(dtype=np.uintp)]:
+    - basis_to_cell_indices(basis_indices)->list[np.array(dtype=np.int32)]:
         returns the indices of the cells who make the support of the given basis.
         This function returns a list of arrays since all basis do not have the same amount of 
         cells in their support
@@ -146,10 +147,10 @@ class UnivariateSplineSpace(Space):
          # --- 1D Basis Construction ---
         
         # 1. Starting indices for each basis function: [0, 1, ..., nfuncs-1]
-        starts = np.arange(self.nfuncs, dtype=np.uintp)
+        starts = np.arange(self.nfuncs, dtype=np.int32)
         
         # 2. Local knots for each basis function: shape (nfuncs, p+2)
-        offsets = np.arange(p1+1, dtype=np.uintp)
+        offsets = np.arange(p1+1, dtype=np.int32)
         self.grid_indices = starts[:, None] + offsets[None, :]
         # coordinates of supported knots (e.g [[-0.5, -0.5, -0.5, -0.25], ...])
         self.local_knots = self.knots[self.grid_indices]
@@ -204,11 +205,11 @@ class UnivariateSplineSpace(Space):
         end_cells = self.knot_to_unique[end_knot_idxs]
 
         if len(basis_indices)==1:
-            return [np.arange(start_cells, end_cells, dtype=np.uintp)]
+            return [np.arange(start_cells, end_cells, dtype=np.int32)]
         
         # Return the range of cells
         # A list comprehension is necessary since BSplines do not span over the same amount of cells
-        return [np.arange(start_cells[i], end_cells[i], dtype=np.uintp) for i in range(len(basis_indices))]
+        return [np.arange(start_cells[i], end_cells[i], dtype=np.int32) for i in range(len(basis_indices))]
     
     def bezier_extraction_operator(self) -> np.ndarray:
         # Pass only the raw data (int and numpy array) to the JIT function
@@ -304,6 +305,19 @@ class UnivariateSplineSpace(Space):
                 rf+=1
             e+=1
         return R, e
+    
+    def evaluate_BSpline(self, point, coeffs=None):
+        assert np.min(self.knots)<=point<np.max(self.knots), "Point is outside the domain."
+
+        design_matrix = BSpline.design_matrix(point, self.knots, self.degree, extrapolate=False)
+        rows, cols = design_matrix.nonzero()
+        nnz_design_matrix = design_matrix[rows, cols]
+        if coeffs is None:
+            coeffs = np.ones_like(nnz_design_matrix)
+        else:
+            assert len(coeffs)==self.degree+1, "Different amount of BSplines and coefficients."
+        return nnz_design_matrix@coeffs
+    
     
     def get_element_extraction_matrix(self, element_idx: int, coarsekn: np.ndarray=None):
         """
@@ -427,12 +441,12 @@ class TensorProductSpace(Space):
     nfuncs_total: int
         number of function in the current TensorProductSpace
 
-    cell_supports: np.ndarray(np.ndarray, dtype=np.uintp), dtype=object)
+    cell_supports: np.ndarray(np.ndarray, dtype=np.int32), dtype=object)
         For each basis function, holds its support cells. Since each basis function 
         does not have the same amount of support cells, this array cannot have a fixed
         width.
 
-    basis_indices_supports = np.ndarray((#cells)x(#supported_functions), dtype=np.uintp)
+    basis_indices_supports = np.ndarray((#cells)x(#supported_functions), dtype=np.int32)
         row j contains the indices of basis functions whose support includes cell j
 
     refinement_operators: list[scipy.sparse.bsr_array]
@@ -494,29 +508,48 @@ class TensorProductSpace(Space):
         self.nfuncs_onedim = [space.nfuncs for space in self.spaces]
         self.nfuncs_total = np.prod(self.nfuncs_onedim)
         self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
-        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.uintp)), dtype=object)
-        self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.uintp))
+        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
+        self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.int32))
         refinement_operators = []
+        bezier_operators = []
         if self.dim==1:
             self.refinement_operators = [sp.bsr_array(self.spaces[0].Rs[i], 
                                                       blocksize=(self.degrees[0]+1, self.degrees[0]+1),
                                                       ) for i in range(len(self.spaces[0].Rs))]
+            self.bezier_operators = self.spaces[0].bezier
         else:
             for rs0 in self.spaces[0].Rs:
                 for rs1 in self.spaces[1].Rs:
                     refinement_operators.append(sp.bsr_array(sp.kron(rs0, rs1, format='bsr'), 
                                                              blocksize=(self.degrees[1]+1, self.degrees[1]+1)))
+                pass
+            pass
+            # for bz0 in self.spaces[0].bezier:
+            #     for bz1 in self.spaces[1].bezier:
+            #         bezier_operators.append(np.kron(bz0, bz1))
+            #     pass
+            # pass
+            bezier_operators = np.kron(self.spaces[0].bezier, self.spaces[1].bezier)
             if self.dim==3:
                 refinement_operators3d = []
+                bezier_operators3d = []
                 for i in range(len(refinement_operators)):
                     for rs2 in self.spaces[2].Rs:
-                        refinement_operators3d.append(sp.bsr_array(sp.kron(refinement_operators[i], rs2, format='bsr'),
-                                                                   blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
+                        refinement_operators3d.append(np.kron(refinement_operators[i], rs2))
                     pass
                 pass
+                # for i in range(len(bezier_operators)):
+                #     for bz2 in self.spaces[2].bezier:
+                #         bezier_operators3d.append(sp.bsr_array(sp.kron(bezier_operators[i], bz2, format='bsr'),
+                #                                                 blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
+                #     pass
+                # pass
+                bezier_operators3d = np.kron(bezier_operators, self.spaces[2].bezier)
                 self.refinement_operators = refinement_operators3d
+                self.bezier_operators = bezier_operators3d
             else:
                 self.refinement_operators = refinement_operators
+                self.bezier_operators = bezier_operators
 
 
     def basis_to_cell(self, basis_indices: np.ndarray)->np.ndarray:
@@ -539,7 +572,7 @@ class TensorProductSpace(Space):
         """
         if len(basis_indices)==0:
             print('No basis list was provided in basis_to_cell.')
-            return np.array([], dtype=np.uintp)
+            return np.array([], dtype=np.int32)
         
         #grid_shape = self.mesh.shape
         tensor_idx = np.unravel_index(basis_indices, self.nfuncs_onedim)
@@ -581,7 +614,7 @@ class TensorProductSpace(Space):
         cell_list = np.atleast_1d(cell_list)
         if len(cell_list) == 0:
             print('No cell list was provided in cell_to_basis().')
-            return np.array([], dtype=np.uintp)
+            return np.array([], dtype=np.int32)
         
         grid_shape: tuple[int]=self.mesh.shape
 
@@ -604,7 +637,7 @@ class TensorProductSpace(Space):
             dims=self.nfuncs_onedim,
             mode='raise'
         )
-        return flat_basis_nd.reshape(len(cell_list), -1).astype(np.uintp)
+        return flat_basis_nd.reshape(len(cell_list), -1).astype(np.int32)
         # 4. Flatten the array and return unique basis indices
         #return np.unique(flat_basis_nd)
 
@@ -630,7 +663,7 @@ class TensorProductSpace(Space):
         >>> self.basis_end_evals
         [array([0], dtype=int32), array([0], dtype=int32), array([0], dtype=int32), array([0], dtype=int32), array([1], dtype=int32)]
         """
-        basis_function_list = np.arange(self.nfuncs_total, dtype=np.uintp)
+        basis_function_list = np.arange(self.nfuncs_total, dtype=np.int32)
         tensor_idx = np.unravel_index(basis_function_list, self.nfuncs_onedim)
         basis_supports=[]
         basis=[]
@@ -639,7 +672,7 @@ class TensorProductSpace(Space):
             supports_d = current_space.supports[tensor_idx[d]]
             basis_supports.append(supports_d)
 
-            basis_d = current_space.knots[np.arange(current_space.nfuncs, dtype=np.uintp)[:, None] + np.arange(current_space.degree+2, dtype=np.uintp)]
+            basis_d = current_space.knots[np.arange(current_space.nfuncs, dtype=np.int32)[:, None] + np.arange(current_space.degree+2, dtype=np.int32)]
             basis.append(basis_d[tensor_idx[d]])
         pass
         self.basis_supports = np.stack(basis_supports, axis=1)
@@ -708,6 +741,18 @@ class TensorProductSpace(Space):
         fine_space = TensorProductSpace(dim=self.dim, univariate_spaces=fine_uss)
 
         return fine_space#, projection_onedim
+    
+    def evaluate_BSpline(self, point, coeffs=None):
+        point = np.atleast_1d(point)
+        assert len(point) == self.dim, "Provided point does not have the appropriate amount of dimensions."
+        result = 1.
+        if coeffs is None:
+            coeffs = [None]*self.dim
+        else:
+            assert len(coeffs)==self.dim, "Provided coefficients do not have the appropriate amount of dimensions."
+        for d in range(self.dim):
+            result*=self.spaces[d].evaluate_BSpline(point[d], coeffs[d])
+        return result
         
     
     def bezier_extraction_operator(self):
