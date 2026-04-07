@@ -60,8 +60,8 @@ class CartesianMesh(Mesh):
         """
         knots_left = [k[:-1] for k in self.knots]
         knots_right = [k[1:] for k in self.knots]
-        cells_bottom_left = np.stack(np.meshgrid(*knots_left), -1).reshape(-1, self.dim)
-        cells_top_right = np.stack(np.meshgrid(*knots_right), -1).reshape(-1, self.dim)
+        cells_bottom_left = np.stack(np.meshgrid(*knots_left, indexing='ij'), -1).reshape(-1, self.dim)
+        cells_top_right = np.stack(np.meshgrid(*knots_right, indexing='ij'), -1).reshape(-1, self.dim)
         cells = np.transpose(np.stack((cells_bottom_left, cells_top_right)), (1,2,0))
 
         return np.squeeze(cells)
@@ -69,7 +69,7 @@ class CartesianMesh(Mesh):
     def find_index(self, point):
         point = np.atleast_1d(point)
         assert len(point)==self.dim, "point does not have the correct amount of dimensions."
-        indices = np.empty(self.dim, dtype=np.intp)
+        indices = np.empty(self.dim, dtype=np.int32)
         for d in range(self.dim):
             knots_d = self.knots[d]
             point_d = point[d]
@@ -82,7 +82,7 @@ class CartesianMesh(Mesh):
         if self.dim==1:
             return indices[0]
         if self.dim==2:
-            return indices[1]*shape[0]+indices[0]
+            return indices[1]+shape[0]*indices[0]
         if self.dim==3:
             return (indices[2] * shape[1] * shape[0]) + (indices[0] * shape[1]) + indices[1]
     
