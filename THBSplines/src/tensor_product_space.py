@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.interpolate import BSpline
+from scipy.interpolate import BSpline, NdBSpline
 # from THBSplines.src_c.BSpline import TensorProductBSpline
 from THBSplines.src.abstract_space import Space
 from THBSplines.src.b_spline import augment_knots, find_knot_index
@@ -61,6 +61,75 @@ def _bezier_extraction_impl(p: int, knots: np.ndarray)->np.ndarray:
         pass
     pass
     return C
+
+#@jit(nopython=True)
+def _oslo1(p: int, coarsekn: np.ndarray, finekn: np.ndarray, cf: int, rf: int)->np.ndarray:
+    p1 = p+1
+    if cf >= len(coarsekn) - 1:
+        return np.zeros(p1)
+
+    if not (coarsekn[cf] <= finekn[rf] < coarsekn[cf+1]):
+        return np.zeros(p1)
+    b = np.zeros(p1)
+    b_temp = np.zeros_like(b)
+    b[0]=1.
+    for k in range(p):
+        t1 = coarsekn[cf-k:cf+1]
+        t2 = coarsekn[cf+1:cf+k+2]
+        denom = t2-t1
+        x = finekn[rf+k+1]
+        w = np.zeros(k+1) #k+1=len(t1)
+        nnz = np.abs(denom)>1e-10
+        w[nnz] = (x-t1)[nnz]/denom[nnz]
+        # with np.errstate(divide='ignore', invalid='ignore'):
+        #     w = (x - t1) / denom
+        #     w = np.nan_to_num(w)
+        b_temp[:k+1] = (1.-w)*b[:k+1]
+        b_temp[1:k+2] = b_temp[1:k+2] + w*b[:k+1]
+        b[:k+2] = b_temp[:k+2]
+        b_temp[:k+2] = 0.
+
+    return b 
+
+#@jit(nopython=True)
+def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.ndarray:
+    uniquekn = np.unique(finekn)
+    rf = 0
+    e = 0
+    p1 = p+1
+    m = len(finekn)
+    R = np.zeros((len(uniquekn)-1, p1, p1))
+    all_cfs = np.searchsorted(coarsekn, finekn, side='right') - 1
+    
+    max_cf = len(coarsekn) - 2 
+    # all_cfs = np.clip(all_cfs, p, max_cf)[:m-p-1]
+    all_cfs = np.minimum(max_cf, np.maximum(all_cfs, p))[:m-p-1]
+    cf = all_cfs[p] 
+    
+    while rf<m-p-1:
+        mult = 1
+        while ((rf+mult<m)and(finekn[rf+mult] == finekn[rf])):
+            mult+=1
+        pass
+        
+        lastcf = cf
+        cf = all_cfs[rf] 
+        
+        if e>0:
+            offs = cf-lastcf
+        
+            R[e, 0:p1-offs, 0:p1-mult] = R[e-1, offs:p1, mult:p1]
+        pass
+
+        for col in range(p1-mult, p1):
+            R[e, :, col] = _oslo1(p, coarsekn=coarsekn, finekn=finekn, cf=cf, rf=rf)
+            rf+=1
+        pass
+
+        e+=1
+    pass
+
+    return R, e
 
 class UnivariateSplineSpace(Space):
     """
@@ -216,47 +285,35 @@ class UnivariateSplineSpace(Space):
         return _bezier_extraction_impl(self.degree, self.knots)
     
     @staticmethod
-    # @jit(nopython=True)
-    def _oslo1(p: int, coarsekn: np.ndarray, finekn: np.ndarray, cf: int, rf: int)->np.ndarray:
-        if cf >= len(coarsekn) - 1:
-            return np.zeros(p + 1)
-
-        if not (coarsekn[cf] <= finekn[rf] < coarsekn[cf+1]):
-            return np.zeros(p + 1)
-        b = np.zeros(p+1)
-        b_temp = np.zeros_like(b)
-        b[0]=1.
-        for k in range(p):
-            t1 = coarsekn[cf-k:cf+1]
-            t2 = coarsekn[cf+1:cf+k+2]
-            denom = t2-t1
-            x = finekn[rf+k+1]
-            w = np.zeros(len(t1))
-            mask = np.abs(denom)>1e-10
-            w[mask] = (x-t1)[mask]/denom[mask]
-            # with np.errstate(divide='ignore', invalid='ignore'):
-            #     w = (x - t1) / denom
-            #     w = np.nan_to_num(w)
-            b_temp[:k+1] = (1.-w)*b[:k+1]
-            b_temp[1:k+2] = b_temp[1:k+2] + w*b[:k+1]
-            b[:k+2] = b_temp[:k+2]
-            b_temp[:k+2] = 0.
-
-        return b 
-    
-    @staticmethod
-    def refine(knots: np.ndarray, p: int)->np.ndarray:
+    def refine(knots: np.ndarray, p: int, n_times: int=1)->np.ndarray:
         """Given `knots`, returns its dyadic refinement with multiplicity `p+1`
         at the extremities."""
-        unique_knots, mults = np.unique(knots, return_counts=True)
-        q1,q2=0,0
-        if mults[0]!=p+1:
-            q1 = p+1-mults[0]
-        if mults[-1]!=p+1:
-            q2=p+1-mults[-1]
-        refined_knots = (unique_knots[1:]+unique_knots[:-1])/2.
-        return np.hstack((unique_knots[0]*np.ones(q1, dtype=unique_knots.dtype), np.hstack((np.sort(np.hstack((knots,refined_knots))), unique_knots[-1]*np.ones(q2, dtype=unique_knots.dtype)))))
+        knots = np.asarray(knots)
+        mult_left = np.searchsorted(knots, knots[0], side='right')
+        mult_right = len(knots) - np.searchsorted(knots, knots[-1], side='left')
+        pad_left = max(0, p + 1 - mult_left)
+        pad_right = max(0, p + 1 - mult_right)
+        if pad_left > 0 or pad_right > 0:
+            knots = np.concatenate((
+                np.full(pad_left, knots[0], dtype=knots.dtype),
+                knots,
+                np.full(pad_right, knots[-1], dtype=knots.dtype)
+            ))
+        if n_times == 0:
+            return knots
         
+        # Find indices where the knot value changes
+        jump_idx = np.where(knots[1:] > knots[:-1])[0]
+        left_vals = knots[jump_idx]
+        right_vals =knots[jump_idx + 1]
+        num_new_points = (1<<n_times)-1
+        fractions = np.linspace(0.,1.,num_new_points+2)[1:-1]
+        new_points = left_vals[:, None] + (right_vals - left_vals)[:, None] * fractions[None, :]
+        new_points = new_points.ravel()
+        insert_positions = np.repeat(jump_idx + 1, num_new_points)
+        
+        return np.insert(knots, insert_positions, new_points)
+
     def element_knot_insertion_operator(self, coarsekn: np.ndarray=None)->np.ndarray:
         """
         Computes local refinement matrices to go from current level to next one. 
@@ -265,55 +322,23 @@ class UnivariateSplineSpace(Space):
         """
         p = self.degree
         coarsekn = self.knots if coarsekn is None else coarsekn
-        finekn = self.refine(coarsekn, p)
-        uniquekn = np.unique(finekn)
+        finekn = self.refine(coarsekn, p, n_times=1)
+        # uniquekn = np.unique(finekn)
         
         m = len(finekn)
         assert m>len(coarsekn), "finekn is not finer than coarsekn"
-        rf = 0
-        e = 0
-        #_, mults = np.unique(finekn, return_counts=True)
-        R = np.zeros((len(uniquekn)-1, p+1, p+1))
-        all_cfs = np.searchsorted(coarsekn, finekn, side='right') - 1
-        
-        max_cf = len(coarsekn) - 2 
-        all_cfs = np.clip(all_cfs, p, max_cf)[:m-p-1]
-        cf = all_cfs[p] 
-        while rf<m-p-1:
-            mult = 1
-            while ((rf+mult<m)and(finekn[rf+mult] == finekn[rf])):
-                mult+=1
-            #mult = fine_mults[e].astype(int)
-            lastcf = cf
-            # while cf+2<len(coarsekn) and coarsekn[cf+1]<=finekn[rf]:
-            #     cf+=1
-            cf = all_cfs[rf] 
-            
-            if e>0:
-                offs = cf-lastcf
-                rows_prev = slice(offs, p + 1)
-                cols_prev = slice(mult, p + 1)
-                
-                rows_curr = slice(0, p + 1 - offs)
-                cols_curr = slice(0, p + 1 - mult)
-            
-                R[e,rows_curr, cols_curr] = R[e-1,rows_prev, cols_prev]
-            start_col = p+1-mult
-            end_col = p+1
-            for col in range(start_col, end_col):
-                R[e, :, col] = self._oslo1(p, coarsekn=coarsekn, finekn=finekn, cf=cf, rf=rf)
-                rf+=1
-            e+=1
-        return R, e
+        R, e = _knot_insertion_impl(p=p, coarsekn=coarsekn, finekn=finekn)
+        return R,e
     
     def evaluate_BSpline(self, point, coeffs=None):
         assert np.min(self.knots)<=point<np.max(self.knots), "Point is outside the domain."
 
-        design_matrix = BSpline.design_matrix(point, self.knots, self.degree, extrapolate=False)
+        design_matrix = BSpline.design_matrix(point, self.knots, self.degree, extrapolate=False)      
         rows, cols = design_matrix.nonzero()
         nnz_design_matrix = design_matrix[rows, cols]
+
         if coeffs is None:
-            coeffs = np.ones_like(nnz_design_matrix)
+            coeffs = np.ones(design_matrix.shape[1])
         else:
             assert len(coeffs)==self.degree+1, "Different amount of BSplines and coefficients."
         return nnz_design_matrix@coeffs
@@ -501,6 +526,7 @@ class TensorProductSpace(Space):
         """
         assert len(univariate_spaces) == dim
         assert dim<=3, "Dimensions higher than 3 are not supported."
+        mode = "sparse" #"dense"
         self.dim: int = dim
         self.spaces: list[UnivariateSplineSpace] = univariate_spaces
         self.degrees: np.ndarray = np.array([space.degree for space in self.spaces])
@@ -510,46 +536,68 @@ class TensorProductSpace(Space):
         self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
         self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
         self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.int32))
+        # There are stored in Fortran order, since they are only on the right-hand side during matrix-matrix multiplication
+        # and need a lot of slicing during the truncation phase
         refinement_operators = []
+        # These are in C-order because we mainly multiply from the left
         bezier_operators = []
         if self.dim==1:
-            self.refinement_operators = [sp.bsr_array(self.spaces[0].Rs[i], 
-                                                      blocksize=(self.degrees[0]+1, self.degrees[0]+1),
-                                                      ) for i in range(len(self.spaces[0].Rs))]
             self.bezier_operators = self.spaces[0].bezier
+            # Scipy is not compatible with numba
+            if mode == "sparse":
+              self.refinement_operators = [sp.csc_array(self.spaces[0].Rs[i]) for i in range(len(self.spaces[0].Rs))]
+            
+            else:                              
+                self.refinement_operators = np.asfortranarray(self.spaces[0].Rs)
+
         else:
-            for rs0 in self.spaces[0].Rs:
-                for rs1 in self.spaces[1].Rs:
-                    refinement_operators.append(sp.bsr_array(sp.kron(rs0, rs1, format='bsr'), 
-                                                             blocksize=(self.degrees[1]+1, self.degrees[1]+1)))
-                pass
-            pass
-            # for bz0 in self.spaces[0].bezier:
-            #     for bz1 in self.spaces[1].bezier:
-            #         bezier_operators.append(np.kron(bz0, bz1))
-            #     pass
-            # pass
-            bezier_operators = np.kron(self.spaces[0].bezier, self.spaces[1].bezier)
-            if self.dim==3:
-                refinement_operators3d = []
-                bezier_operators3d = []
-                for i in range(len(refinement_operators)):
-                    for rs2 in self.spaces[2].Rs:
-                        refinement_operators3d.append(np.kron(refinement_operators[i], rs2))
+            if mode == "sparse":
+                for rs0 in self.spaces[0].Rs:
+                    for rs1 in self.spaces[1].Rs:
+                        refinement_operators.append(sp.csc_array(sp.kron(rs0, rs1, format='csc')))
                     pass
                 pass
-                # for i in range(len(bezier_operators)):
-                #     for bz2 in self.spaces[2].bezier:
-                #         bezier_operators3d.append(sp.bsr_array(sp.kron(bezier_operators[i], bz2, format='bsr'),
-                #                                                 blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
-                #     pass
-                # pass
-                bezier_operators3d = np.kron(bezier_operators, self.spaces[2].bezier)
-                self.refinement_operators = refinement_operators3d
-                self.bezier_operators = bezier_operators3d
+                for bz0 in self.spaces[0].bezier:
+                    for bz1 in self.spaces[1].bezier:
+                        bezier_operators.append(sp.bsr_array(sp.kron(bz0, bz1, format='bsr'),
+                                                blocksize=(self.degrees[1]+1, self.degrees[1]+1)))
+                    pass
+                pass
             else:
-                self.refinement_operators = refinement_operators
+                refinement_operators = np.kron(self.spaces[0].Rs, self.spaces[1].Rs)
+                bezier_operators = np.kron(self.spaces[0].bezier, self.spaces[1].bezier)
+            
+            if self.dim==3:
+                
+                if mode=="sparse":
+                    refinement_operators3d = []
+                    bezier_operators3d = []
+                    for i in range(len(refinement_operators)):
+                        for rs2 in self.spaces[2].Rs:
+                            refinement_operators3d.append(sp.csc_array(sp.kron(refinement_operators[i], rs2, format='csc')))
+                        pass
+                    pass
+                    for i in range(len(bezier_operators)):
+                        for bz2 in self.spaces[2].bezier:
+                            bezier_operators3d.append(sp.bsr_array(sp.kron(bezier_operators[i], bz2, format='bsr'),
+                                                             blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
+                        pass
+                    pass
+                    self.refinement_operators = refinement_operators3d
+                
+                else:
+                    refinement_operators3d = np.kron(refinement_operators, self.spaces[2].Rs)
+                    self.refinement_operators = np.asfortranarray(refinement_operators3d)
+                    bezier_operators3d = np.kron(bezier_operators, self.spaces[2].bezier)
+                    self.bezier_operators = bezier_operators3d
+                    
+            else:
                 self.bezier_operators = bezier_operators
+                if mode=="sparse":
+                    self.refinement_operators = refinement_operators
+                else:
+                    self.refinement_operators = np.asfortranarray(refinement_operators)
+                
 
 
     def basis_to_cell(self, basis_indices: np.ndarray)->np.ndarray:
@@ -745,14 +793,16 @@ class TensorProductSpace(Space):
     def evaluate_BSpline(self, point, coeffs=None):
         point = np.atleast_1d(point)
         assert len(point) == self.dim, "Provided point does not have the appropriate amount of dimensions."
-        result = 1.
-        if coeffs is None:
-            coeffs = [None]*self.dim
+        
+        if self.dim==1:
+            return self.spaces[0].evaluate_BSpline(point, coeffs)
         else:
-            assert len(coeffs)==self.dim, "Provided coefficients do not have the appropriate amount of dimensions."
-        for d in range(self.dim):
-            result*=self.spaces[d].evaluate_BSpline(point[d], coeffs[d])
-        return result
+            design_matrix = NdBSpline.design_matrix(point, tuple([self.spaces[i] for i in range(self.dim)]), self.degrees[0], extrapolate=False)
+            nnz1, nnz2 = design_matrix.nonzero()
+            if coeffs is not None:
+                return design_matrix[nnz1, nnz2] @ coeffs
+            else:
+                return design_matrix[nnz1, nnz2]
         
     
     def bezier_extraction_operator(self):
