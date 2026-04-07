@@ -309,27 +309,21 @@ class HierarchicalMesh(Mesh):
                 parent_node = parent_node.parent
             pass
             return parent_node.index
+        pass
         
         for level in range(start_level, stop_level, -1):
             marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         return marked_cells_at_start_level
     
-    def _is_point_in_cell_geometry(self, node, point):
+    def _is_point_in_cell_geometry(self, node, point)->bool:
         """Checks if a point is inside the bounding box of a specific node."""
         # Retrieve the cell's AABB: shape (dim, 2) -> [[min_x, max_x], [min_y, max_y]...]
         cell_bounds = np.atleast_2d(self.meshes[node.level].cells[node.index])
         
         eps = np.spacing(1.) # Tolerance for floating point boundaries
-        for d in range(self.dim):
-            c_min, c_max = cell_bounds[d]
-            if not (point[d] >= c_min - eps and point[d] <= c_max + eps):
-                return False
-            pass
-        pass
+        return np.all( (cell_bounds[:, 0]-eps<point) & (cell_bounds[:, 1]+eps>point) )
+        
 
-        return True
-
-            
     def find_active_cell(self, point: np.ndarray)->tuple[int, int]:
         """Given `point`, returns the level and the finest cell that contains it.
         
@@ -420,7 +414,7 @@ class HierarchicalMesh(Mesh):
         import matplotlib.patches as mpatches
 
         fig, ax = plt.subplots(figsize=figsize)
-        colors = plt.cm.get_cmap('tab10', max(10, self.nlevels))
+        colors = plt.get_cmap('tab10', max(10, self.nlevels))
         for level in range(self.nlevels):
             active_cells = self.meshes[level].cells[self.aelem_level[level]]
             if self.meshes[0].dim==2:
