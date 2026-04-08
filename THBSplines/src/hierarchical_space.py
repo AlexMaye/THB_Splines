@@ -1,5 +1,6 @@
 from functools import reduce
-from typing import Union, List
+from typing import Union
+import numpy.typing as npt
 
 import numpy as np
 import scipy.sparse as sp
@@ -12,10 +13,10 @@ warnings.filterwarnings('error')
 
 class HierarchicalSpace(Space):
 
-    def cell_to_basis(self, cell_indices: Union[np.ndarray, List[int]]) -> np.ndarray:
+    def cell_to_basis(self, cell_indices: Union[np.ndarray, list[int]]) -> np.ndarray:
         pass
 
-    def basis_to_cell(self, basis_indices: Union[np.ndarray, List[int]]) -> np.ndarray:
+    def basis_to_cell(self, basis_indices: Union[np.ndarray, list[int]]) -> np.ndarray:
         pass
 
     def __init__(self, knots: list, degrees: list):
@@ -30,23 +31,23 @@ class HierarchicalSpace(Space):
         univariate_spline_spaces = [UnivariateSplineSpace(degree=self.degrees[d], knots=knots[d]) for d in range(self.dim)]
         self.level_spaces: dict[int, TensorProductSpace] = {0: TensorProductSpace(dim=self.dim, univariate_spaces=univariate_spline_spaces)}
         self.nlevels = 1
-        self.active_functions: dict[int, np.ndarray] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.int32)}
-        self.deactivated_functions: dict[int, np.ndarray] = {0: np.array([], dtype=np.int32)}
-        # Functions of level l that are supported on \Omega^l_{-}
-        self.Bl_minus: dict[int, np.ndarray] = {0: np.array([], dtype=np.int32)}
-        self.truly_active: dict[int, np.ndarray] = self.active_functions
+        self.active_functions: dict[int, npt.NDArray[np.int32]] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.int32)}
+        self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {0: np.array([], dtype=np.int32)}
+        # Functions of level l that are supported on Ω^l_{-}
+        self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {0: np.array([], dtype=np.int32)}
+        self.truly_active: dict[int, npt.NDArray[np.int32]] = self.active_functions
 
         l0_space = self.level_spaces[0]
         n_funcs0 = l0_space.nfuncs_total
-        self.active_cell_counts: dict[int, np.ndarray] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.int32)}
+        self.active_cell_counts: dict[int, npt.NDArray[np.int32]] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.int32)}
 
-        self.refinement_operators: dict[int, np.ndarray] = {0: self.level_spaces[0].refinement_operators}
-        self.bezier_operators: dict[int, np.ndarray] = {0: self.level_spaces[0].bezier_operators}
+        self.refinement_operators: dict[int, list[sp.csc_array]] = {0: self.level_spaces[0].refinement_operators}
+        self.bezier_operators: dict[int, list[sp.bsr_array]] = {0: self.level_spaces[0].bezier_operators}
 
         self.get_all_active_functions_on_cell
         
 
-    def refine(self, marked_cells: list, level: int, axes=None):
+    def refine(self, marked_cells: list[int], level: int, axes=None):
         """
         Refines the specified cells at a given level.
         
@@ -172,9 +173,10 @@ class HierarchicalSpace(Space):
         A cell is said to be active if it was not refined.
         """
         # Dictionaries for each refinement level
-        self.active_functions = {}
-        self.deactivated_functions = {}
-        self.Bl_minus = {}
+        self.active_functions: dict[int, npt.NDArray[np.int32]] = {}
+        self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {}
+        self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {}
+        self.truly_active: dict[int, npt.NDArray[np.int32]] = {}
         
         for l in range(self.nlevels):
             space_l: TensorProductSpace = self.level_spaces[l]
@@ -182,15 +184,15 @@ class HierarchicalSpace(Space):
             # Quick lookup dictionary for level l cells
             nodes_l: list[CellNode] = self.mesh.nodes[l]
             
-            is_active_mask = np.zeros(nfuncs, dtype=bool)
-            is_minus_mask = np.zeros_like(is_active_mask)
+            is_active_mask: npt.NDArray[np.bool_] = np.zeros(nfuncs, dtype=bool)
+            is_minus_mask: npt.NDArray[np.bool_] = np.zeros_like(is_active_mask)
 
             for cell_idx, node in enumerate(nodes_l):
-                cell_active = node.is_active
-                parent_active = node.parent.is_active if node.parent else False
+                cell_active: bool = node.is_active
+                parent_active: bool = node.parent.is_active if node.parent else False
 
                 if cell_active or parent_active:
-                    affected_funcs: np.ndarray = space_l.cell_to_basis(cell_idx)
+                    affected_funcs: npt.NDArray[np.int_] = space_l.cell_to_basis(cell_idx)
                     if cell_active:
                         is_active_mask[affected_funcs]=True
                     if parent_active:
@@ -208,7 +210,7 @@ class HierarchicalSpace(Space):
             
         pass
 
-    def get_children(self, level, marked_functions_at_level, tol: float=1e-7):
+    def get_children(self, level: int, marked_functions_at_level: int|list[int]|npt.NDArray[np.int_], tol: float=1e-8):
         """
         Return the indices of the children function of the marked functions
         at the given level.
@@ -217,9 +219,24 @@ class HierarchicalSpace(Space):
         :param marked_functions_at_level: list of function indices marked at given refinement level.
         :return: np.array of indices
         """
+        assert level>=0, "Requested level must be non-negative"
+        assert level+1<=len(self.level_spaces), "Function of the next level have not been initialised."
 
-        supports_of_marked_functions: np.ndarray = self.spaces[level].basis_supports[marked_functions_at_level]
-        supports_of_finer_functions: np.ndarray = self.spaces[level+1].basis_supports
+        support_cells: list[npt.NDArray[np.int_]] = self.level_spaces[level].basis_to_cell(marked_functions_at_level)
+        children_cells = []
+        for cell in support_cells:
+            _, children = self.mesh.get_children(level=level, marked_cells_at_level=cell)
+            children_cells.append(children)
+        
+        children_funcs = []
+        for cell in children_cells:
+            funcs_on_cell = self.level_spaces[level+1].cell_to_basis(cell)
+            children_funcs.append(np.unique(funcs_on_cell))
+        return children_funcs
+        
+
+        supports_of_marked_functions: npt.NDArray[np.float_] = self.spaces[level].basis_supports[marked_functions_at_level]
+        supports_of_finer_functions: npt.NDArray[np.float_] = self.spaces[level+1].basis_supports
         min_finer = supports_of_finer_functions[:, :, 0]
         max_finer = supports_of_finer_functions[:, :, 1]
         
@@ -371,13 +388,13 @@ class HierarchicalSpace(Space):
             
         return M
     
-    def build_global_dof_map(self):
+    def build_global_dof_map(self)->tuple[dict[tuple[int, int], int], int]:
         """Numbers active functions that are not active on a coarser level.
 
         Returns
         --------------
-        - dof_map: dict[level, func_idx]
-            global numbering of active functions (those who have support on \Omega^l_{-} are not in `dof_map`).
+        - dof_map: dict[(level, local_func_idx), global_func_idx]
+            global numbering of active functions (those who have support on Ω^l_{-} are not in `dof_map`).
         - int:
             Greatest element in `dof_map`
 
@@ -430,7 +447,7 @@ class HierarchicalSpace(Space):
         pass
         return global_indices
     
-    def get_all_active_functions_on_cell(self, level: int, cell_idx: int)->dict:
+    def get_all_active_functions_on_cell(self, level: int, cell_idx: int)->dict[int, npt.NDArray[np.int32]]:
         """Given a cell at `level`, returns functions from all levels that are active on it.
         
         Returns
@@ -449,15 +466,15 @@ class HierarchicalSpace(Space):
 
         for l in range(level, -1, -1): 
             # All functions with support on the relevant cell
-            functions_on_cell = self.level_spaces[l].cell_to_basis(current_cell)
+            functions_on_cell: npt.NDArray[np.int_] = self.level_spaces[l].cell_to_basis(current_cell)
             #all_functions[l] = functions
 
-            # active functions with no support on \Omega^l_{-}
-            truly_active = self.truly_active[l]
+            # active functions with no support on Ω^l_{-}
+            truly_active: npt.NDArray[np.int32] = self.truly_active[l]
 
             if len(functions_on_cell)>0 and len(truly_active)>0:
                 # Given the functions that have support on this cell, which ones are active?
-                active_mask: np.ndarray[bool] = self._my_isin(functions_on_cell, truly_active)
+                active_mask: npt.NDArray[np.bool_] = self._my_isin(functions_on_cell, truly_active)
                 active_functions_l[l] = functions_on_cell[active_mask]
 
                 # idx = np.searchsorted(truly_active, functions)
@@ -499,7 +516,23 @@ class HierarchicalSpace(Space):
             return scaled_operator@design_matrix[nnz1, nnz2]
 
         
-    def _legendre_to_bezier(self, degree: int):
+    def _legendre_to_bezier(self, degree: int)->npt.NDArray[np.float_]:
+        """Consider a degree n, unnormalised shifted Legendre basis functions L_k on [0,1] with coefficients l_k and Bernstein basis polynomials b_{k, n}
+        with coefficients c_k such that, for a polynomial t_n we have
+
+        t_n(x) = Σ_k l_k L_k(x) = Σ_k c_k b_{k,n}(x),
+
+        or in matrix form
+
+        t_n(x) = L(x).l = B_n(x).b .
+
+        This function returns a matrix B_{L->B} such that 
+
+        B_{L->B}l = b.
+
+
+        The formula is a vectorised version of the one presented in "Legendre-Bernstein basis transformations" by Rida T. Farouki (eq. 20).
+        """
         from scipy.special import comb
         n = degree
         indices = np.arange(n + 1)
@@ -514,7 +547,22 @@ class HierarchicalSpace(Space):
         
         return G @ F
     
-    def _bezier_to_legendre(self, degree: int):
+    def _bezier_to_legendre(self, degree: int) -> npt.NDArray[np.float_]:
+        """Consider a degree n, unnormalised shifted Legendre basis functions L_k on [0,1] with coefficients l_k and Bernstein basis polynomials b_{k, n}
+        with coefficients c_k such that, for a polynomial t_n we have
+
+        t_n(x) = Σ_k l_k L_k(x) = Σ_k c_k b_{k,n}(x),
+
+        or in matrix form
+
+        t_n(x) = L(x).l = B_n(x).b .
+
+        This function returns a matrix B_{B->L} such that 
+
+        B_{B->L}b = l.
+
+        The formula is a vectorised version of the one presented in "Legendre-Bernstein basis transformations" by Rida T. Farouki (eq. 21).
+        """
         from scipy.special import comb
         n = degree+1
         js = np.arange(n)
@@ -712,20 +760,43 @@ class HierarchicalSpace(Space):
             cells = np.union1d(cells, np.flatnonzero(condition))
         return cells
 
-    def refine_in_rectangle(self, rectangle, level):
+    def refine_in_rectangle(self, rectangle: npt.NDArray, level: int):
         """
-        Returns the set active of indices marked for refinement contained in
-        the given rectangle
+        Refines the mesh from `level` to `level`+1. All cells that intersect with the rectangle are refined up to a suitable level.
+        This is to avoid L-shaped domains.
 
-        :param rectangle: array containing endpoints of rectangle
+        :param rectangle: array containing endpoints of rectangle as [[a,b], [cd]] = [a,b]x[c,d]
         :param level: refinement level
-        :return: indices of active cells markde for refinement.
+        :return: indices of active cells marked for refinement.
         """
-        eps = np.spacing(1)
-        cells = self.mesh.meshes[level].cells
-        cells_to_mark = np.all((rectangle[:, 0] <= cells[:, :, 0] + eps) & (eps + rectangle[:, 1] >= cells[:, :, 1]),
-                               axis=1)
-        return np.intersect1d(np.flatnonzero(cells_to_mark), self.mesh.aelem_level[level])
+        
+        rectangle=np.atleast_2d(rectangle)
+        assert rectangle.shape == (2,2), "Provided rectangle does not have an appropriate shape."
+        eps = 1e-10
+
+        def find_intersecting_geometrically(level: int, cell_indices: npt.NDArray[np.int_]):
+                #start with coarse mesh to eliminate many cells
+                cells = self.mesh.meshes[level].cells[cell_indices]
+                rect_min = rectangle[:, 0]  
+                rect_max = rectangle[:, 1]
+                cell_min = cells[..., 0]    
+                cell_max = cells[..., 1]
+                # overlap condition: (min1 <= max2) AND (max1 >= min2)
+                overlap_dims = (rect_min <= cell_max - eps) & (rect_max >= cell_min + eps)
+                intersecting_cells = np.all(overlap_dims, axis=-1)
+
+                #  Get the active indices of those cells
+                active_indices = np.where(intersecting_cells)[0]
+                return active_indices
+        
+        active_indices = find_intersecting_geometrically(0, np.arange(self.mesh.nel_per_level[0], dtype=np.int32))
+        self.refine(marked_cells=active_indices, level=0)
+
+        for l in range(1, level+1):
+                _, children_cells = self.mesh.get_children(level=l-1, marked_cells_at_level=active_indices)
+                active_indices = children_cells[find_intersecting_geometrically(l, children_cells)]
+                self.refine(marked_cells=active_indices, level=l)
+        
 
     def plot_overloading(self, filename=None, text=False, fontsize=None):
         import matplotlib.pyplot as plt
