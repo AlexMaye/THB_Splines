@@ -3,6 +3,7 @@ from THBSplines.src.abstract_mesh import Mesh
 from THBSplines.src.cartesian_mesh import CartesianMesh
 from scipy.spatial import KDTree
 from collections import deque
+import numpy.typing as npt
 
 class CellNode:
     "Tree node representing a cell in a hierarchical mesh."
@@ -63,20 +64,20 @@ class HierarchicalMesh(Mesh):
     """
 
     def __init__(self, knots, dim):
-        self.meshes = [CartesianMesh(knots, dim)]
-        self.nlevels = 1
-        self.dim=dim
+        self.meshes: list[CartesianMesh] = [CartesianMesh(knots, dim)]
+        self.nlevels: int = 1
+        self.dim: int=dim
 
-        self.nodes = {0: [CellNode(level=0,index=i) for i in range(self.meshes[0].nelems)]}
+        self.nodes: dict[int, list[CellNode]] = {0: [CellNode(level=0,index=i) for i in range(self.meshes[0].nelems)]}
         for node in self.nodes[0]:
             node.is_active=True
 
-        self._aelem_level_set = {0: set(range(self.meshes[0].nelems))}  # active elements on level
-        self._delem_level_set = {0: set()}  # deactivated elements on level
+        self._aelem_level_set: dict[int, set[int]] = {0: set(range(self.meshes[0].nelems))}  # active elements on level
+        self._delem_level_set:dict[int, set[int]] = {0: set()}  # deactivated elements on level
 
-        self.aelem_level = {0: np.array(list(self._aelem_level_set[0]), dtype=np.int32)}
-        self.delem_level = {0: np.array(list(self._delem_level_set[0]), dtype=np.int32)}
-        self.nel_per_level = {0: self.meshes[0].nelems}
+        self.aelem_level:dict[int, npt.NDArray[np.int_]] = {0: np.array(list(self._aelem_level_set[0]), dtype=np.int32)}
+        self.delem_level:dict[int, npt.NDArray[np.int_]] = {0: np.array(list(self._delem_level_set[0]), dtype=np.int32)}
+        self.nel_per_level:dict[int, int] = {0: self.meshes[0].nelems}
 
         self.cell_area_per_level = {0: self.meshes[0].cell_areas}
         self.nel = self.meshes[0].nelems
@@ -90,7 +91,7 @@ class HierarchicalMesh(Mesh):
         coarse_level=self.nlevels-1
         fine_level=self.nlevels
         coarse_mesh: CartesianMesh = self.meshes[-1]
-        fine_mesh = coarse_mesh.refine() # refine method of CartesianMesh
+        fine_mesh: CartesianMesh = coarse_mesh.refine() # refine method of CartesianMesh
         self.meshes.append(fine_mesh)
         self.nlevels += 1
 
@@ -153,7 +154,7 @@ class HierarchicalMesh(Mesh):
         pass
     pass
 
-    def refine(self, marked_cells: np.ndarray, at_level: int):
+    def refine(self, marked_cells: npt.NDArray[np.int_]|list[int], at_level: int):
         """
         Refines the hierarchical mesh, and updates the global element indices
         of active elements for each level.
@@ -180,7 +181,7 @@ class HierarchicalMesh(Mesh):
         pass
     pass
 
-    def _update_active_cells(self, marked_cells, at_level: int):
+    def _update_active_cells(self, marked_cells: list[int]|npt.NDArray[np.int_], at_level: int):
         """
         Updates the set of active cells and deactivated cells.
 
@@ -234,7 +235,7 @@ class HierarchicalMesh(Mesh):
         pass
     pass
 
-    def get_children(self, level: int, marked_cells_at_level: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def get_children(self, level: int, marked_cells_at_level: list[int]|npt.NDArray[np.int_]|int) -> tuple[npt.NDArray[np.int_], npt.NDArray[np.int_]]:
         """
         For given level l and marked cells {Q_i^l}, returns fine cells {Q_k^{l+1}| there exists i such that Q_k^{l+1}⊆Q_i^l}
 
@@ -260,7 +261,7 @@ class HierarchicalMesh(Mesh):
 
         return np.array(coarse_cells, dtype=np.int32), np.array(indices, dtype=np.int32)
     
-    def get_parent(self, level:int, marked_cells_at_level: np.ndarray, skip_assert=False) -> np.ndarray:
+    def get_parent(self, level:int, marked_cells_at_level: list[int]|npt.NDArray[np.int_]|int, skip_assert=False) -> npt.NDArray[np.int_]:
         """
         For given level l and marked cells {Q_i^l}, returns coarse cells {Q_k^{l-1}| there exists k such that Q_i^l⊆Q_k^{l-1}}
 
@@ -291,7 +292,7 @@ class HierarchicalMesh(Mesh):
         pass
         return indices
     
-    def get_parent_at_level(self, start_level: int, stop_level: int, marked_cells_at_start_level: np.ndarray)->np.ndarray:
+    def get_parent_at_level(self, start_level: int, stop_level: int, marked_cells_at_start_level: npt.NDArray[np.int_])->np.ndarray:
         """Returs parents of `marked_cells_at_start_level` at level `stop_level`. """
         assert start_level>=0 and stop_level>=0 and stop_level<=start_level and start_level<=self.nlevels
         assert np.max(marked_cells_at_start_level)<len(self.nodes[start_level]), "There aren't as many cells at that level."
@@ -315,7 +316,7 @@ class HierarchicalMesh(Mesh):
             marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         return marked_cells_at_start_level
     
-    def _is_point_in_cell_geometry(self, node, point)->bool:
+    def _is_point_in_cell_geometry(self, node: CellNode, point: npt.NDArray)->bool:
         """Checks if a point is inside the bounding box of a specific node."""
         # Retrieve the cell's AABB: shape (dim, 2) -> [[min_x, max_x], [min_y, max_y]...]
         cell_bounds = np.atleast_2d(self.meshes[node.level].cells[node.index])
@@ -324,7 +325,7 @@ class HierarchicalMesh(Mesh):
         return np.all( (cell_bounds[:, 0]-eps<point) & (cell_bounds[:, 1]+eps>point) )
         
 
-    def find_active_cell(self, point: np.ndarray)->tuple[int, int]:
+    def find_active_cell(self, point: npt.NDArray)->tuple[int, int]:
         """Given `point`, returns the level and the finest cell that contains it.
         
         Returns
@@ -402,7 +403,7 @@ class HierarchicalMesh(Mesh):
         pass
         
 
-    def plot_cells(self, figsize=(10,5), return_fig = False) -> None:
+    def plot_cells(self, figsize:tuple=(10,5), return_fig = False) -> None:
         """
         Plots the hierarchical mesh, and optionally returns the figure handle.
         Otherwise, the figure is displayed.
