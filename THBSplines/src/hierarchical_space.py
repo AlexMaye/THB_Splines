@@ -1,23 +1,14 @@
-from functools import reduce
-from typing import Union
 import numpy.typing as npt
 
 import numpy as np
 import scipy.sparse as sp
-from THBSplines.src.abstract_space import Space
 from THBSplines.src.hierarchical_mesh import HierarchicalMesh, CellNode
 from THBSplines.src.tensor_product_space import TensorProductSpace, UnivariateSplineSpace
 
 import warnings
 warnings.filterwarnings('error')
 
-class HierarchicalSpace(Space):
-
-    def cell_to_basis(self, cell_indices: Union[np.ndarray, list[int]]) -> np.ndarray:
-        pass
-
-    def basis_to_cell(self, basis_indices: Union[np.ndarray, list[int]]) -> np.ndarray:
-        pass
+class HierarchicalSpace():
 
     def __init__(self, knots: list, degrees: list):
         """Initialise one level """
@@ -210,49 +201,6 @@ class HierarchicalSpace(Space):
             
         pass
 
-    def get_children(self, level: int, marked_functions_at_level: int|list[int]|npt.NDArray[np.int_], tol: float=1e-8):
-        """
-        Return the indices of the children function of the marked functions
-        at the given level.
-
-        :param level: refinement level
-        :param marked_functions_at_level: list of function indices marked at given refinement level.
-        :return: np.array of indices
-        """
-        assert level>=0, "Requested level must be non-negative"
-        assert level+1<=len(self.level_spaces), "Function of the next level have not been initialised."
-
-        support_cells: list[npt.NDArray[np.int_]] = self.level_spaces[level].basis_to_cell(marked_functions_at_level)
-        children_cells = []
-        for cell in support_cells:
-            _, children = self.mesh.get_children(level=level, marked_cells_at_level=cell)
-            children_cells.append(children)
-        
-        children_funcs = []
-        for cell in children_cells:
-            funcs_on_cell = self.level_spaces[level+1].cell_to_basis(cell)
-            children_funcs.append(np.unique(funcs_on_cell))
-        return children_funcs
-        
-
-        supports_of_marked_functions: npt.NDArray[np.float_] = self.spaces[level].basis_supports[marked_functions_at_level]
-        supports_of_finer_functions: npt.NDArray[np.float_] = self.spaces[level+1].basis_supports
-        min_finer = supports_of_finer_functions[:, :, 0]
-        max_finer = supports_of_finer_functions[:, :, 1]
-        
-        min_marked = supports_of_marked_functions[:, :, 0]
-        max_marked = supports_of_marked_functions[:, :, 1]
-        is_min_inside = min_finer >= (min_marked[:, None, :] - tol)
-        is_max_inside = max_finer <= (max_marked[:, None, :] + tol)
-        is_child = np.all(is_min_inside & is_max_inside, axis=2)
-        # A finer function is a child if it is contained in AT LEAST ONE marked function.
-        is_child_of_any = np.any(is_child, axis=0)
-
-        # Get the 1D indices of the finer functions that returned True
-        indices = np.where(is_child_of_any)[0]
-        
-        return indices
-
     def _truncation_operator(self, element_idx: int, element_level: int, l: int)->sp.csc_array:
         """
         it represents with functions of level l
@@ -354,10 +302,12 @@ class HierarchicalSpace(Space):
         
         #return J
     
-    def _my_isin(self, ar1: np.ndarray, ar2: np.ndarray)->np.ndarray[bool]:
-        """`np.isin` when both arrays are sorted and have unique values.
+    def _my_isin(self, ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
+        """`np.isin` when `ar2` is sorted.
         No checks are performed to ensure this.
         """
+        ar1 = np.array(ar1)
+        ar2 = np.array(ar2)
         idx = np.searchsorted(ar2, ar1)
         valid_mask = idx < len(ar2)
         cols_to_keep = np.zeros(len(ar1), dtype=bool)
@@ -388,6 +338,97 @@ class HierarchicalSpace(Space):
             
         return M
     
+    def _deduplicate_dofs(self, dofs:list[tuple])->list[tuple]:
+        """Helper method to remove duplicates while strictly preserving insertion order."""
+        seen = set()
+        dedup = []
+        for item in dofs:
+            if item not in seen:
+                seen.add(item)
+                dedup.append(item)
+        return dedup
+
+    def build_better_dof_map(self)->tuple[dict[tuple[int, int], int], int]:
+        max_level = len(self.level_spaces) - 1
+        
+        current_dofs: list[tuple[int, int]] = [(0, f) for f in np.arange(self.level_spaces[0].nfuncs_total, dtype=self.truly_active[0].dtype)]
+        for l in range(max_level):
+            next_dofs = []
+            # Extract all level 'l' functions currently in the list to check their activity
+            funcs_l: list[int] = [f for (lvl, f) in current_dofs if lvl == l]
+                
+            # If there are no active functions of level l, make sure to eliminate possible duplicates.
+            #Then, move on to the lext level.
+            if not funcs_l:
+                current_dofs: list[tuple[int, int]] = self._deduplicate_dofs(current_dofs)
+                continue
+
+            # Find which level 'l' functions are inactive.
+            # This is not the same as deactivated functions.
+            active_mask: npt.NDArray[np.bool_] = self._my_isin(funcs_l, self.truly_active[l])
+            inactive_funcs: npt.NDArray[np.int32] = np.array(funcs_l)[~active_mask]
+
+            # Batch fetch children for the inactive functions
+            children_map: dict[int, npt.NDArray[np.int32]] = {}
+            if len(inactive_funcs) > 0:
+                sort_idx = np.argsort(inactive_funcs)
+                sorted_inactive = inactive_funcs[sort_idx]
+                
+                children_list_sorted: list[npt.NDArray[np.int32]] = self.level_spaces[l].get_children_functions(sorted_inactive)
+                
+                for i, s_idx in enumerate(sort_idx):
+                    # Map the parent function ID directly to its list of children
+                    children_map[inactive_funcs[s_idx]] = children_list_sorted[i]
+                pass
+            pass
+
+            # Expand the list: replace inactive functions with their children in-place
+            for lvl, f in current_dofs:
+                # Checking the level makes sure that we replace the inactive functions of the previous iteration
+                # by the newly found children function.
+                # The previous iteration, we replaced the inactive functions with each of their children in 
+                # current_dofs. 
+                # Now, we look at these children (filtered by lvl==l), 
+                # and see which of them have to be replaced (f in children_map).
+                # When such a function is found, we skip this function in next_dofs, and 
+                # append the children instead.
+                if lvl == l and f in children_map:
+                    for child in children_map[f]:
+                        # next dofs is initialised to [] at the beginning of each l iteration
+                        next_dofs.append((l + 1, child))
+                else:
+                    next_dofs.append((lvl, f))
+            pass
+                    
+            # Update and deduplicate, strictly preserving the order of first appearance
+            # if a function is the child of several functions, we keep the first occurence.
+            current_dofs = self._deduplicate_dofs(next_dofs)
+
+        pass
+
+        # Final filtering to remove any max_level functions that are not truly active
+        max_level_funcs: list[np.int32] = [f for (lvl, f) in current_dofs if lvl == max_level]
+        if max_level_funcs:
+            active_max_mask: npt.NDArray[np.bool_] = self._my_isin(max_level_funcs, self.truly_active[max_level])
+            active_max_set = set(np.array(max_level_funcs)[active_max_mask])
+        else:
+            active_max_set = set()
+
+        # Build the final dictionary mapping (lvl, f) -> global ID
+        dof_map = {}
+        next_id = 0
+        for lvl, f in current_dofs:
+            if lvl == max_level and f not in active_max_set:
+                continue
+            
+            k = (lvl, f)
+            if k not in dof_map:
+                dof_map[k] = next_id
+                next_id += 1
+                
+        greatest_id = next_id - 1 if next_id > 0 else 0
+        return dof_map, greatest_id
+                
     def build_global_dof_map(self)->tuple[dict[tuple[int, int], int], int]:
         """Numbers active functions that are not active on a coarser level.
 
@@ -413,6 +454,7 @@ class HierarchicalSpace(Space):
         (2, np.int32(16)): 9, <br>
         (2, np.int32(17)): 10}
         """
+                
         dof_map = {}
         next_id = 0
         for l in range(self.nlevels):
