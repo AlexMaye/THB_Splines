@@ -4,11 +4,64 @@ import numpy as np
 import scipy.sparse as sp
 from THBSplines.src.hierarchical_mesh import HierarchicalMesh, CellNode
 from THBSplines.src.tensor_product_space import TensorProductSpace, UnivariateSplineSpace
+from copy import deepcopy
 
 import warnings
 warnings.filterwarnings('error')
 
 class HierarchicalSpace():
+    """
+    This class holds everything related to a B-Spline hierarchical space, with the meshes of all different levels,
+    active and inactive cells/functions, and change of basis matrices to go from univariate Legendre basis polynomials to Bernstein
+    basis polynomials and vice-versa, from multivariate Bernstein basis polynomials to multivariate B-Splines, and the local 
+    truncation refinement operators to go from coarse B-Splines to their finer truncated counterparts.
+
+    When considering a sequence of nested B-Spline spaces V^0 ⊂ ... ⊂ V^N defined on a domain Ω, each space V^l spanned by the normalised 
+    B-Spline basis B^l attached to a knots vector k^l. One can consider a subset of elements e^l that partitions the underlying domain, 
+    which will be referred to as active cells. The union of these active cells is denoted as Ω^l.
+
+    Attributes
+    ---------------------
+    - degree: list[int]
+        list of degrees of the univariate B-Splines in [x,y,z] order.
+
+    - dim: int
+        number of dimensions in the space. This is currently capped to 3.
+
+    - nlevels: int
+        number of refinement levels. Starts at 1.
+
+    - mesh: HierarchicalMesh
+        custom class which keeps track of active/inactive cells in the tensor product mesh.
+
+    - level_spaces: dict[int, TensorProductSpace]
+        holds full tensor product spaces with associated mesh, B-Splines and operators for a given level.
+
+    - active_functions: dict[int, np.ndarray(np.int32)]
+        keeps track of active functions at each level. A function of level l is said to be _active_ if 
+        it has support on Ω^l. 
+
+    - deactivated_functions: dict[int, np.ndarray(np.int32)]
+        keeps track of inactive functions at each level. A function of level l is said to be _inactive_
+        if it does not have support on Ω^l.
+
+    - Bl_minus: dict[int, np.ndarray(np.int32)]
+        keeps track of functions of level l whose support overlaps the coarser domain Ω^{l-1}.
+
+    - truly_active: dict[int, np.ndarray(np.int32)]
+        keeps track of active functions of level l whose support does not overlap the coarser domain Ω^{l-1}.
+
+    - active_cell_counts: dict[int, np.ndarray(np.int32)]
+        keeps track of the number of active cell at each level.
+
+    - refinement_operators: dict[int, list[scipy.sparse.csc_array]]
+        Stores the operators that express a B-Spline of level l on cell i_{l+1} as a linear
+        combinations of B-Splines of level l+1 on cell i_{l+1}.
+
+    - bezier_operators: dict[int, list[scipy.sparse.bsr_array]]
+        Stores the operators that express a Bernstein basis polynomial of level l on cell i
+        as a linear combination of B-Splines of level l on cell i.
+    """
 
     def __init__(self, knots: list, degrees: list):
         """Initialise one level """
@@ -26,16 +79,16 @@ class HierarchicalSpace():
         self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {0: np.array([], dtype=np.int32)}
         # Functions of level l that are supported on Ω^l_{-}
         self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {0: np.array([], dtype=np.int32)}
-        self.truly_active: dict[int, npt.NDArray[np.int32]] = self.active_functions
+        self.truly_active: dict[int, npt.NDArray[np.int32]] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.int32)}
 
         l0_space = self.level_spaces[0]
         n_funcs0 = l0_space.nfuncs_total
-        self.active_cell_counts: dict[int, npt.NDArray[np.int32]] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.int32)}
+        self.active_cell_counts: dict[int, npt.NDArray[np.int32]] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.int16)}
 
         self.refinement_operators: dict[int, list[sp.csc_array]] = {0: self.level_spaces[0].refinement_operators}
         self.bezier_operators: dict[int, list[sp.bsr_array]] = {0: self.level_spaces[0].bezier_operators}
 
-        self.get_all_active_functions_on_cell
+        # self.get_all_active_functions_on_cell
         
 
     def refine(self, marked_cells: list[int], level: int, axes=None):
@@ -46,36 +99,61 @@ class HierarchicalSpace():
         :param level: The level at which the marked_cells currently exist.
         :param axes: Optional list of axes to refine.
         """
-
+        assert level>=0, "Provided level must be non.negative."
+        assert np.min(marked_cells)>=0, "Cell indices start at 0."
+        
         marked_cells = np.atleast_1d(marked_cells)
-        current_level = self.nlevels-1
         if len(marked_cells) == 0:
             return
-
-        # 1. If we are refining cells on the currently finest level, 
-        # we MUST generate the next level mathematically and physically.
+        marked_cells = np.unique(marked_cells)
+        current_level = self.nlevels-1
+        
+        # If we are refining cells on the currently finest level, 
+        # generate the next level.
         if level >= current_level:
             while(self.nlevels<=level+1):
-                self.add_level(axes=axes)
+                self._add_level(axes=axes)
             pass
         pass
+         
 
-        # 2. Update the physical mesh topology
-        # This includes refining the current finest mesh and creating new CellNodes if necessary, 
+        # Keep a copy of cells that were already refined, so that they don't get
+        # analysed an additional time when active functions are updated.
+        # The deepcopy is needed because the content must not be overwritten 
+        # by the call to self.mesh.refine() later on.
+        previously_inactive_cells = deepcopy(self.mesh.delem_level)
+
+        # Update the physical mesh topology
+        # This includes refining the current finest mesh, creating new CellNodes if necessary, 
         # and updating active/deactivated cells
         self.mesh.refine(marked_cells=marked_cells, at_level=level)
         
-        # 3. Re-evaluate basis function statuses (Active vs Deactivated)
-        # if level<=current_level:
-        #     # Faster function if we are not skipping levels
-        #     self._update_active_functions_incremental(marked_cells, level)
-        # else:
-        #     pass
-        self._update_active_functions()
+    
+        # Make sure that we are not refining an already refined cell.
+        to_refine_mask = np.ones_like(marked_cells, dtype=bool)
+        nodes_l = self.mesh.nodes[level]
+        for idx, cell in enumerate(marked_cells):
+                if nodes_l[cell].is_active:
+                    to_refine_mask[idx] = False
+                pass
+        pass
+        if not np.any(to_refine_mask):
+            return
+        marked_cells = marked_cells[to_refine_mask]
+
+        for l in range(level+1):
+            cells = self.mesh.get_parent_at_level(start_level=level, stop_level=l, marked_cells_at_start_level=marked_cells)
+            # Don't work with cells that were already refined, i.e the cells that were
+            # inactive during the previous call of refine
+            cells = np.setdiff1d(cells, previously_inactive_cells[l], assume_unique=False)
+            if cells.size!=0:
+                self._update_active_functions_incremental(marked_cells=cells, level=l)
         
+       
+        # self._update_active_functions()
         
 
-    def add_level(self, axes=None):
+    def _add_level(self, axes=None):
         """
         Adds a level l of refinement to the hierarchical space.
         """
@@ -84,52 +162,63 @@ class HierarchicalSpace():
         pass
         l = self.nlevels-1
         self.nlevels+=1
-        #univariate_spline_spaces = [self.level_spaces[l].spaces[d].refine() for d in range(self.dim)]
+        
         new_space: TensorProductSpace = self.level_spaces[l].refine(dims=axes)
         self.level_spaces[l+1] = new_space
 
-        # new_knots = [uni.knots for uni in new_space.spaces]
-
-        # self.mesh.add_level(new_knots)
-
-        # self.refinement_operators[l+1] = new_space.compute_refinement_matrix(self.level_spaces[l_fine])
         self.active_functions[l + 1] = np.array([], dtype=self.active_functions[l].dtype)
         self.deactivated_functions[l + 1] = np.array([], dtype=self.active_functions[l].dtype)
         self.bezier_operators[l+1] = self.level_spaces[l+1].bezier_operators
         self.refinement_operators[l+1] = self.level_spaces[l+1].refinement_operators
 
-    def _update_active_functions_incremental(self, marked_cells: np.ndarray, level: int):
-        """Updates active and deactivated functions when `marked_cells` at `level` have been refined to `level+1`. """
+    def _update_active_functions_incremental(self, marked_cells: npt.NDArray[np.int_], level: int):
+        """Updates active and deactivated functions when `marked_cells` at `level` have been refined to `level`+1. """
 
         space_l = self.level_spaces[level]
         # all affected functions
-        impacted_basis_l = np.unique(np.concatenate(space_l.cell_to_basis(marked_cells)))
-        # supports = space_l.basis_to_cell(impacted_basis_l)
-        # not sure if this can be vectorized since basis_to_cell returns a list of numpy arrays
-        for b_idx in impacted_basis_l:
-            support = space_l.basis_to_cell(b_idx)[0]
-            num_removed = np.isin(support, marked_cells).sum()
-            self.active_cell_counts[level][b_idx]-=num_removed
-        pass
-        self.active_functions[level] = np.where(self.active_cell_counts[level]>0)[0]
-        self.deactivated_functions[level] = np.where(self.active_cell_counts[level] == 0)[0]
 
+        # Find the functions that have some support on the refined cells, 
+        # then find all the support cells of these functions.
+        # If a function does not have any active cells left in its support, 
+        # remove it from the list of active cells at that level.
+        impacted_basis_l = np.unique(space_l.cell_to_basis(marked_cells))
+        marked_cells = np.atleast_1d(marked_cells)
+        for b_idx in impacted_basis_l:
+            support = space_l.basis_to_cell(b_idx)
+            
+            num_removed = self._my_isin(support, marked_cells).sum()
+            self.active_cell_counts[level][b_idx] -= num_removed
+        pass
+        function_stays = self.active_cell_counts[level]>0
+        self.active_functions[level] = np.flatnonzero(function_stays).astype(np.int32)
+        self.deactivated_functions[level] = np.flatnonzero(~function_stays).astype(np.int32)
+        self.Bl_minus[level] = np.intersect1d(self.Bl_minus[level], self.active_functions[level], assume_unique=True)
+        self.truly_active[level] = np.setdiff1d(self.active_functions[level], self.Bl_minus[level], assume_unique=True)
+
+        # Then move on to the next level, and update active functions by
+        # 1) computing which cells are now active, 
+        # 2) computing which functions have support on these cells,
+        # 3) computing how many active cells a function has in its support,
+        # 4) updating active functions based on this new information.
+        
         next_level = level+1
         if next_level in self.level_spaces:
             space_lp1 = self.level_spaces[next_level]
             
             # New children cells are created in the mesh during refine()
             # We find which functions at L+1 cover the children of marked_cells
-            # In B-Splines, refinement is predictable: 1 cell splits into 2^dim children
+            # Here, refinement is predictable: 1 cell splits into 2^dim children
             # We ask the mesh for the children indices
-            children_cells = []
-            for c in marked_cells:
-                children_cells.extend([child.index for child in self.mesh.nodes[level][c].children])
+            children_cells = np.empty(shape=(len(marked_cells), 2**self.dim), dtype=np.int32)
+            nodes_l = self.mesh.nodes[level]
+            for idx, c in enumerate(marked_cells):
+                children_cells[idx, :] = np.array([child.index for child in nodes_l[c].children], dtype=np.int32)
+                #children_cells.extend([child.index for child in nodes_l[c].children])
             pass
             
-            children_cells = np.array(children_cells)
+            # children_cells = np.array(children_cells)
             # all functions that are supported on the newly refined cells
-            impacted_basis_lp1 = np.unique(np.concatenate(space_lp1.cell_to_basis(children_cells)))
+            impacted_basis_lp1 = np.unique(np.concatenate(space_lp1.cell_to_basis(children_cells.ravel())))
             
             # If this is a newly created level, initialize counts to 0
             if next_level not in self.active_cell_counts:
@@ -150,9 +239,13 @@ class HierarchicalSpace():
                 pass
             pass
 
-            self.active_functions[next_level] = np.where(self.active_cell_counts[next_level] > 0)[0]
-            self.deactivated_functions[next_level] = np.where(self.active_cell_counts[next_level] == 0)[0]
+            function_stays = self.active_cell_counts[next_level]>0
+            self.active_functions[next_level] = np.flatnonzero(function_stays).astype(np.int32)
+            #print(f"active functions = {self.active_functions}")
+            self.deactivated_functions[next_level] = np.flatnonzero(~function_stays).astype(np.int32)
             self.Bl_minus[next_level] = Bl_minus
+            self.truly_active[next_level] = np.setdiff1d(self.active_functions[next_level], self.Bl_minus[next_level], assume_unique=True)
+            #print(f"active functions = {self.active_functions}")
         pass
     pass
 
@@ -240,7 +333,7 @@ class HierarchicalSpace():
         # cols_to_truncate = np.isin(fine_funcs_on_elem, Bl_minus_arr, assume_unique=True)
         keep_mask = (self._my_isin(fine_funcs_on_elem, Bl_minus_arr)).astype(np.float64)
         D = sp.diags_array(keep_mask, format='csc', dtype=np.float64)
-        R_sliced = R_local.dot(D)
+        R_sliced = R_local@D
         return R_sliced
         # return R_local[:, cols_to_truncate], cols_to_truncate, R_local.shape[1]
         
@@ -307,7 +400,10 @@ class HierarchicalSpace():
         No checks are performed to ensure this.
         """
         ar1 = np.array(ar1)
-        ar2 = np.array(ar2)
+        ar2 = np.atleast_1d(ar2)
+        if len(ar2)<2:
+            # searchsorted fails for short arrays
+            return np.isin(ar1, ar2)
         idx = np.searchsorted(ar2, ar1)
         valid_mask = idx < len(ar2)
         cols_to_keep = np.zeros(len(ar1), dtype=bool)
@@ -331,7 +427,7 @@ class HierarchicalSpace():
             R_sliced = self._truncation_operator(element_idx=element_idx, element_level=element_level, l=ll)
             # M_top = np.zeros((M.shape[0], num_cols), dtype=M.dtype)
             # M_top[:, mask] = M@R_sliced
-            M_top = M.dot(R_sliced)
+            M_top = M@R_sliced
             # Get J for current level
             J_l = self._compute_J(element_idx=element_idx, element_level=element_level, l=ll)
             M = sp.vstack((M_top, J_l), format='csr')
@@ -519,12 +615,6 @@ class HierarchicalSpace():
                 active_mask: npt.NDArray[np.bool_] = self._my_isin(functions_on_cell, truly_active)
                 active_functions_l[l] = functions_on_cell[active_mask]
 
-                # idx = np.searchsorted(truly_active, functions)
-
-                # idx[idx == len(truly_active)] = len(truly_active) - 1
-                # # Keep only the functions that actually match the value at the found index
-                # mask = truly_active[idx] == functions
-                # active_functions_l[l] = functions[mask]
             else:
                 active_functions_l[l] = np.array([], dtype=functions_on_cell.dtype)
 
@@ -635,172 +725,6 @@ class HierarchicalSpace():
         M = lefts[:, np.newaxis] * inner_sum
 
         return M
-        
-
-    def get_basis_conversion_matrix(self, level, coarse_indices=None):
-        """
-        Returns the basis conversion matrix taking you from level to the
-        next.
-
-        :param level: refinement level of the underlying tensor product space
-        :param coarse_indices: indices of the coarse active functions.
-        :return: a basis conversion matrix
-        """
-        print('Space dimensions', self.nfuncs_level[level], self.spaces[level].nfuncs,
-              self.spaces[level].nfuncs_onedim)
-        if coarse_indices is None:
-            c = self.compute_full_projection_matrix(level)
-        else:
-
-            prod = np.prod(self.spaces[level + 1].degrees + 2) * len(coarse_indices)  # allocate space for data
-            rows = np.zeros(prod)
-
-            columns = np.zeros_like(rows)
-            values = np.zeros_like(rows)
-
-            ncounter = 0
-            sub_coarse = np.unravel_index(coarse_indices, self.spaces[level].nfuncs_onedim)
-            # TODO: Ugly hack!!!
-            # unravel_index gives basis functions in the opposite order from my implementation.
-            if self.dim == 2:
-                sub_coarse = [sub_coarse[1], sub_coarse[0]]
-            for i in range(len(coarse_indices)):
-                C = 1
-                for dim in range(self.dim):
-                    C = sp.kron(self.projections_onedim[level][dim][:, sub_coarse[dim][i]], C)
-                ir, ic, iv = sp.find(C)
-                rows[ncounter: len(ir) + ncounter] = ir
-                columns[ncounter: len(ir) + ncounter] = i
-                values[ncounter: len(ir) + ncounter] = iv
-
-                ncounter += len(ir)
-
-            rows = rows[:ncounter]
-            columns = columns[:ncounter]
-            values = values[:ncounter]
-            c = sp.coo_matrix((values, (rows, columns)),
-                              shape=(self.spaces[level + 1].nfuncs, self.spaces[level].nfuncs)).tolil()
-
-        if self.truncated:
-            i = np.union1d(self.afunc_level[level + 1], self.dfunc_level[level + 1])
-            c[i, :] = 0
-        return c
-
-    def compute_full_projection_matrix(self, level):
-        """
-        Computes the kroneker product of the 1D basis-projections at a given
-        level and stores it as a sparse matrix.
-
-        :param level: refinement level in question
-        :return: sparse projection matrix
-        """
-        c = 1
-        for dim in range(self.dim):
-            c = sp.kron(self.projections_onedim[level][dim], c)
-        c = c.tolil()
-        return c
-
-    def functions_to_deactivate_from_cells(self, marked_cells: dict):
-        """
-        Returns the indices of functions that have no active cells within
-        their support.
-
-        :param marked_cells: cell indices to check against
-        :return: function indices
-        """
-        marked_functions = {}
-        for level in range(self.nlevels):
-            func_to_deact = self.spaces[level].get_basis_functions(marked_cells[level])
-            func_to_deact = np.intersect1d(func_to_deact, self.afunc_level[level])
-
-            func_to_keep = np.array([], dtype=np.int)
-            _, func_cells_map = self.spaces[level].get_cells(func_to_deact)
-            for f in func_to_deact:
-                func_cells = func_cells_map[f]
-                common_elements = np.intersect1d(func_cells, self.mesh.aelem_level[level])
-                if common_elements.size != 0:
-                    func_to_keep = np.append(func_to_keep, f)
-            func_to_deact = np.setdiff1d(func_to_deact, func_to_keep)
-            marked_functions[level] = func_to_deact
-        return marked_functions
-
-    def _get_all_cells(self):
-        all_cells = []
-        for i, mesh in enumerate(self.mesh.meshes):
-            for cell in mesh.cells[self.mesh.aelem_level[i]]:
-                all_cells.append(cell)
-        return np.array(all_cells)
-
-    def create_subdivision_matrix(self, mode='reduced') -> dict:
-        """
-        Returns hspace.nlevels-1 matrices used for representing coarse
-        B-splines in terms of the finer B-splines.
-        
-        :param mode: whether to create a full or a reduced subdivision matrix. Only reduced supported at the moment.
-        :return: a dictionary mapping
-        """
-
-        mesh = self.mesh
-
-        C = {}
-        C[0] = sp.identity(self.spaces[0].nfuncs, format='lil')
-        C[0] = C[0][:, self.afunc_level[0]]
-
-        if mode == 'reduced':
-            func_on_active_elements = self.spaces[0].get_basis_functions(mesh.aelem_level[0])
-            func_on_deact_elements = self.spaces[0].get_basis_functions(mesh.delem_level[0])
-            func_on_deact_elements = np.union1d(func_on_deact_elements, func_on_active_elements)
-            for level in range(1, self.nlevels):
-                I_row_idx = self.afunc_level[level]
-                I_col_idx = list(range(self.nfuncs_level[level]))
-
-                data = np.ones(len(I_col_idx))
-                I = sp.coo_matrix((data, (I_row_idx, I_col_idx)),
-                                  shape=(self.spaces[level].nfuncs, self.nfuncs_level[level]))
-                aux = self.get_basis_conversion_matrix(level - 1, coarse_indices=func_on_deact_elements)
-                func_on_active_elements = self.spaces[level].get_basis_functions(mesh.aelem_level[level])
-                func_on_deact_elements = self.spaces[level].get_basis_functions(mesh.delem_level[level])
-                func_on_deact_elements = np.union1d(func_on_deact_elements, func_on_active_elements)
-                C[level] = sp.hstack([aux @ C[level - 1], I])
-            return C
-        else:
-            for level in range(1, self.nlevels):
-                I = sp.identity(self.spaces[level].nfuncs, format='lil')
-                aux = self.get_basis_conversion_matrix(level - 1)
-                C[level] = sp.hstack([aux @ C[level - 1], I[:, self.afunc_level[level]]])
-            return C
-
-    def _get_truncated_supports(self):
-        """
-        Returns the indices at the fine level that constitutes the supports of
-        each truncated basis function.
-
-        :return: indices of cells that support each truncated basis function.
-        """
-        C = self.create_subdivision_matrix(mode='full')[self.nlevels - 1].toarray()
-        trunc_basis_to_fine_idx = {}
-        for i, trunc_coeff in enumerate(C.T):
-            fine_active_basis = np.flatnonzero(trunc_coeff)
-            basis_support_cells = self._get_fine_basis_support_cells(fine_active_basis)
-            trunc_basis_to_fine_idx[i] = self.mesh.meshes[-1].cells[basis_support_cells]
-        return trunc_basis_to_fine_idx
-
-    def _get_fine_basis_support_cells(self, fine_active_basis):
-        """
-        Given a list of functions, returns the unique cells at the finest level
-        in their common support.
-
-        :param fine_active_basis: list of function indices
-        :return: a set of cells at the finest refinement level in their common support
-        """
-
-        cells = np.array([], dtype=np.int)
-        fine_cells = self.mesh.meshes[-1].cells
-        for i in fine_active_basis:
-            supp = self.spaces[-1].basis_supports[i]
-            condition = np.all((supp[:, 0] <= fine_cells[:, :, 0]) & (supp[:, 1] >= fine_cells[:, :, 1]), axis=1)
-            cells = np.union1d(cells, np.flatnonzero(condition))
-        return cells
 
     def refine_in_rectangle(self, rectangle: npt.NDArray, level: int):
         """
