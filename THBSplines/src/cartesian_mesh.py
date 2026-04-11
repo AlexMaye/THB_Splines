@@ -1,23 +1,24 @@
 import numpy as np
+import numpy.typing as npt
 
-from THBSplines.src.abstract_mesh import Mesh
 
-
-class CartesianMesh(Mesh):
+class CartesianMesh():
     """
     Attributes
     ---------
-    knots: np.ndarray
-        knot vectors defining the mesh. They are not repeated.
+    knots: npt.NDArray
+        knot vectors defining the mesh. They are sorted and not repeated.
     dim: int
         number of dimensions
-    cells: np.ndarray
+    cells: npt.NDArray
         represented as AABB, i.e each cell is identified by its bottom left and top right index [[min1, max1], [min2, max2], ..., ]. 
         Is a list of N cells of shape (N, dim, 2).
     nelems: int
         number N of cells
-    cell_areas: np.ndarray
+    cell_areas: npt.NDArray
         area of each cell of shape (N), 
+    shape: tuple
+        number of points in each dimension
 
     Methods
     ----------
@@ -29,13 +30,7 @@ class CartesianMesh(Mesh):
 
     """
 
-    def plot_cells(self) -> None:
-        pass
-
-    def get_gauss_points(self, cell_indices: np.ndarray) -> np.ndarray:
-        pass
-
-    def __init__(self, knots: list, parametric_dimension: int):
+    def __init__(self, knots: list[list]|npt.NDArray, parametric_dimension: int):
         """
         Represents a regular cartesian mesh in ``parametric_dimension`` dimensions.
 
@@ -66,7 +61,17 @@ class CartesianMesh(Mesh):
 
         return np.squeeze(cells)
     
-    def find_index(self, point):
+    def find_index(self, point: npt.ArrayLike)->int:
+        """Finds index of the cell that contains `point`.
+        If `point` lies at the boundary of a cell, this method will return 
+        the cell that is up and to the right of `point`.
+
+        
+
+        :param point: list of coordinates.
+        :return None: if point lies outside the mesh
+        :return int: cell index that contains the point
+        """
         point = np.atleast_1d(point)
         assert len(point)==self.dim, "point does not have the correct amount of dimensions."
         indices = np.empty(self.dim, dtype=np.int32)
