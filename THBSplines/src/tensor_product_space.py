@@ -1,19 +1,17 @@
-from functools import lru_cache
 from typing import Optional
 import numpy.typing as npt
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.interpolate import BSpline, NdBSpline
-# from THBSplines.src_c.BSpline import TensorProductBSpline
-from THBSplines.src.abstract_space import Space
-from THBSplines.src.b_spline import augment_knots, find_knot_index
 from THBSplines.src.cartesian_mesh import CartesianMesh
 from numba import jit
 
 #@jit(nopython=True)
 def _bezier_extraction_impl(p: int, knots: npt.ArrayLike)->npt.NDArray[np.float64]:
-
+    """ Based on the paper 'Isogeometric finite element data structures based on Bézier extraction of T-splines'
+      ( https://doi.org/10.1002/nme.2968), algorithm 1."""
+    
     #p = self.degree
     #knots = self.knots
     
@@ -65,6 +63,10 @@ def _bezier_extraction_impl(p: int, knots: npt.ArrayLike)->npt.NDArray[np.float6
 
 #@jit(nopython=True)
 def _oslo1(p: int, coarsekn: npt.ArrayLike, finekn: npt.ArrayLike, cf: int, rf: int)->npt.NDArray[np.float64]:
+    """ 
+    From [Multi-level Bézier extraction for hierarchical local refinement of Isogeometric Analysis](https://doi.org/10.1016/j.cma.2017.08.017),
+    algorithm 1.
+    """
     p1: int = p+1
     if cf >= len(coarsekn) - 1:
         return np.zeros(p1)
@@ -94,6 +96,10 @@ def _oslo1(p: int, coarsekn: npt.ArrayLike, finekn: npt.ArrayLike, cf: int, rf: 
 
 #@jit(nopython=True)
 def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.ndarray:
+    """
+    From [Multi-level Bézier extraction for hierarchical local refinement of Isogeometric Analysis](https://doi.org/10.1016/j.cma.2017.08.017),
+    algorithm 3.
+    """
     uniquekn = np.unique(finekn)
     rf = 0
     e = 0
@@ -132,24 +138,28 @@ def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.n
 
     return R, e
 
-class UnivariateSplineSpace(Space):
+class UnivariateSplineSpace():
     """
+
+    This class represents a space with univariate B-Splines based on a knot vector. 
+    It also implements many utility functions that serve truncated hierarchical B-Splines.
+
     Attributes
     --------------
     - degree: int
-        degree of the BSplines 
+        degree of the B-Splines.
 
     - knots: np.ndarray
-        knots associated to the BSplines, with the provided multiplicities.
+        knots associated to the B-Splines, with the provided multiplicities.
     
     - nfuncs: int
-        number of functions associated to these knots and degree
+        number of functions associated to these knots and degree.
 
     - unique_knots: np.ndarray
-        knots without the multiplicity
+        knots without the multiplicity.
 
     - knot_to_unique: np.ndarray
-        array to find back `self.knots` for `self.unique_knots(return_inverse=True)`. See `np.unique` for more detail
+        array to find back `self.knots` for `self.unique_knots(return_inverse=True)`. See `np.unique` for more detail.
     
     - n_cells: int
         number of cells in this space
@@ -186,9 +196,24 @@ class UnivariateSplineSpace(Space):
         This function returns a list of arrays since all basis do not have the same amount of 
         cells in their support
 
-    - refine(knots, p)->np.ndarray:
-        given `knots` and a degree `p`, computes the dyadic refinement of the knots with 
+    - refine(knots, p, n_times)->np.ndarray:
+        given `knots` and a degree `p`, computes the dyadic refinement `n_times` of the knots with 
         respect to `p`. Boundary multiplicities are handled automatically.
+
+    - element_knot_insertion_operator():
+        Computes local refinement matrices to go from current level to next one.
+
+    - evaluate_BSpline(point, coeffs):
+        performs the evaluation of the BSplines at the given point.
+    
+    - get_element_extraction_matrix(element_idx):
+        Constructs the (p+1)x(p+1) matrix M for a specific fine element 'e' such that:
+        N_coarse_local(u) = M @ N_fine_local(u).
+
+    - get_children_functions(indices):
+        Given the indices of BSplines in the current space, returns a list of indices of children BSplines
+        in the dyadic refinement of the current space.
+
 
     """
 
@@ -233,12 +258,6 @@ class UnivariateSplineSpace(Space):
 
         self.Rs, _ = self.element_knot_insertion_operator()
         self.bezier = self.bezier_extraction_operator()
-
-    def cell_to_basis(self, cell_indices):
-        pass
-
-    def basis_to_cell(self, basis_indices):
-        pass
 
     def cell_to_basis_indices(self, cell_indices: int | npt.NDArray[np.int_] | list[int]) -> npt.NDArray[np.int_]:
         """
@@ -286,9 +305,9 @@ class UnivariateSplineSpace(Space):
     
     @staticmethod
     def refine(knots: npt.ArrayLike, p: int, n_times: int=1)->npt.NDArray:
-        """Given `knots`, returns its dyadic refinement with multiplicity `p+1`
+        """Given `knots`, returns its dyadic refinements done `n_times` with multiplicity `p+1`
         at the extremities."""
-        knots = np.asarray(knots)
+        knots = np.asarray(knots, dtype=np.float64)
         mult_left = np.searchsorted(knots, knots[0], side='right')
         mult_right = len(knots) - np.searchsorted(knots, knots[-1], side='left')
         pad_left = max(0, p + 1 - mult_left)
@@ -414,7 +433,7 @@ class UnivariateSplineSpace(Space):
     
 
     def _get_fine_cells_in_coarse_cell(self, coarse_cell: int, cell_size: float):
-        "Get the indices "
+        "Given the indices in the current space, returns the indices of the children cells in the dyadic refinement."
         finekn = self.knots
         factor = int(cell_size/np.max(np.diff(finekn)))
         if factor==1:
@@ -423,31 +442,31 @@ class UnivariateSplineSpace(Space):
         
         return np.arange(factor)+coarse_cell*factor
 
-    def get_children_functions(self, coarse_func_idx: int, fine_space: "UnivariateSplineSpace")->np.ndarray:
-        "Does not work"
-        return
-        coarse_cells = self.basis_to_cell_indices(basis_indices=coarse_func_idx)[0]
-
-        children_1d=set()
-
-        for c_cell in coarse_cells:
-            R_local = self.Rs[c_cell]
-            active_coarse_funcs = self.cell_to_basis_indices(cell_indices=c_cell)[0]
-            local_row = np.where(active_coarse_funcs == coarse_func_idx)[0][0]
-            non_zero_local_cols = np.where(R_local[local_row, :] > 1e-12)[0]
-            fine_cells_in_c = fine_space._get_fine_cells_in_coarse_cell(coarse_cell=c_cell, cell_size=np.max(np.diff(self.unique_knots)))
-            active_fine_funcs = fine_space.cell_to_basis_indices(cell_indices=fine_cells_in_c)
+    def get_children_functions(self, indices: list[int]|npt.NDArray[np.int_]|int)->list[npt.NDArray[np.int32]]:
+        """Given the indices of BSplines in the current space, returns a list of indices of children BSplines
+        in the dyadic refinement of the current space."""
         
-            # Map the non-zero local columns to global fine indices
-            global_fine_children = active_fine_funcs[:, non_zero_local_cols]
-            children_1d.update(global_fine_children.ravel())
-            
-        return np.array(list(children_1d), dtype=int)
+        p1 = self.degree+1
+        indices = np.atleast_1d(indices)
+        knots = self.knots
+        unique_knots = self.unique_knots
+        left_knots = knots[indices]
+        right_knots = knots[indices+p1]
+
+        insert_left = np.searchsorted(unique_knots, left_knots, side='left')
+        insert_right = np.searchsorted(unique_knots, right_knots, side='left')
+
+        j_min = indices + insert_left
+        j_max = indices + insert_right
+
+        return [np.arange(start, end + 1, dtype=np.int32) 
+            for start, end in zip(j_min, j_max)]
 
 
-class TensorProductSpace(Space):
+class TensorProductSpace():
     """
-    Aggregates d Univariate spaces. It represents one global grid resolution
+    Aggregates d Univariate spaces. It represents one global grid resolution.
+    This class does not currently support spaces of dimension 4 or more.
 
     Attributes
     ---------
@@ -465,6 +484,9 @@ class TensorProductSpace(Space):
 
     nfuncs_total: int
         number of function in the current TensorProductSpace
+    
+    nfuncs_nextdim: list[int]
+        number of functions per dimension after a dyadic refinement of the current mesh    
 
     cell_supports: np.ndarray(np.ndarray, dtype=np.int32), dtype=object)
         For each basis function, holds its support cells. Since each basis function 
@@ -474,8 +496,11 @@ class TensorProductSpace(Space):
     basis_indices_supports = np.ndarray((#cells)x(#supported_functions), dtype=np.int32)
         row j contains the indices of basis functions whose support includes cell j
 
-    refinement_operators: list[scipy.sparse.bsr_array]
+    refinement_operators: list[scipy.sparse.csc_array]
         holds the kronecker products of local multi-level refinement operators of the 1D spaces.
+
+    bezier_operators: list[scipy.sparse.bsr_array]
+        holds the kronecker products of local bezier extraction operators.
 
         
     Methods
@@ -485,11 +510,11 @@ class TensorProductSpace(Space):
     
     basis_to_cell(basis_indices):
         Returns the indices of cells in the support of the passed basis
-    
-    get_cells(basis_function_list):
-        Given a list of basis function indices, returns the support for each basis
-        function as well as a dictionary mapping the basis function indices
-        to the corresponding cell indices.
+
+    get_children_functions(indices):
+        Given indices of functions in the current space, returns the indices
+        of the corresponding children functions if a dyadic refinement of the 
+        current space was made.
     
     construct_basis():
         Initializes the tensor product space by (implicitly) creating all the BSplines and
@@ -497,20 +522,20 @@ class TensorProductSpace(Space):
         and with respect to the knots.
     
     refine():
-        dyadic refinement of the current knots. Returns a new TensorProductSpace
-        and the projection matrix to go from one space to the other.
-    
-    bezier_extraction_operator():
-        For each dimension, computes the local Bézier extraction operators.
-        The result is saved in a new attribute `self.bezier_extraction_operators`.
-    
-    element_knot_insertion_operators():
-        For each dimension, computes local extraction operators for current knots to the next refinement level.
-        The result is saved in a new attribute `self.insertion_operators`.
+        dyadic refinement of the current knots. Returns a new TensorProductSpace.
+        
+    evaluate_BSpline(point, coeffs):
+        evaluates B-Splines a the current point with the given coefficients for each
+        B-Spline.
     
     get_element_extraction_matrix(element_idx, p, coarsekn, finekn):
         Constructs the (p+1)x(p+1) matrix M for a specific fine element 'e' such that:
         N_coarse_local(u) = M @ N_fine_local(u).
+
+    get_cells(basis_function_list):
+        Given a list of basis function indices, returns the support for each basis
+        function as well as a dictionary mapping the basis function indices
+        to the corresponding cell indices.
     
     
     
@@ -532,71 +557,69 @@ class TensorProductSpace(Space):
         self.degrees: npt.NDArray[np.int_] = np.array([space.degree for space in self.spaces])
         # The total number of basis functions in this flat space
         self.nfuncs_onedim: npt.NDArray[np.int32] = np.array([space.nfuncs for space in self.spaces], dtype=np.int32)
+        self.nfuncs_nextdim = self.nfuncs_onedim + np.array([len(np.where(self.spaces[d].knots[1:]>self.spaces[d].knots[:-1])[0]) for d in range(self.dim)])
         self.nfuncs_total: int = np.prod(self.nfuncs_onedim)
         self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
         self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
         self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.int32))
-        # There are stored in Fortran order, since they are only on the right-hand side during matrix-matrix multiplication
-        # and need a lot of slicing during the truncation phase
-        refinement_operators: list[sp.csc_array[np.float64]] = []
-        # These are in C-order because we mainly multiply from the left
-        bezier_operators: list[sp.bsr_array[np.float64]] = []
-        if self.dim==1:
-            self.bezier_operators = self.spaces[0].bezier
-            # Scipy is not compatible with numba
-            if mode == "sparse":
-              self.refinement_operators = [sp.csc_array(self.spaces[0].Rs[i]) for i in range(len(self.spaces[0].Rs))]
-            
-            else:                              
-                self.refinement_operators = np.asfortranarray(self.spaces[0].Rs)
+        
+        self._set_bezier_and_refinements(mode=mode)
 
-        else:
+    def _set_bezier_and_refinements(self, mode: str="sparse"):
+        """Initialises the attributes `self.refinement_operators` and `self.bezier_operators`, either with dense
+        numpy arrays or sparse scipy arrays depending on `mode`. 
+        """
+
+        # In dense mode, these are stored in Fortran order, since they are only on the right-hand side during matrix-matrix multiplication
+        # and need a lot of slicing during the truncation phase.
+        refinement_operators: list[sp.csc_array[np.float64]] = []
+        # In dense mode, these are in C-order because we mainly multiply from the left
+        bezier_operators: list[sp.bsr_array[np.float64]] = []
+
+        if self.dim==1:
+            # store everything in dense format since the arrays are not sparse.
+            self.bezier_operators = self.spaces[0].bezier                          
+            self.refinement_operators = np.asfortranarray(self.spaces[0].Rs)
+
+        else: #dim = 2 or 3
             if mode == "sparse":
-                for rs0 in self.spaces[0].Rs:
-                    for rs1 in self.spaces[1].Rs:
-                        refinement_operators.append(sp.csc_array(sp.kron(rs0, rs1, format='csc')))
-                    pass
-                pass
-                for bz0 in self.spaces[0].bezier:
-                    for bz1 in self.spaces[1].bezier:
-                        bezier_operators.append(sp.bsr_array(sp.kron(bz0, bz1, format='bsr'),
-                                                blocksize=(self.degrees[1]+1, self.degrees[1]+1)))
-                    pass
-                pass
-            else:
+                sp0 = self.spaces[0]
+                sp1 = self.spaces[1]
+            
+                bezier_operators = [sp.bsr_array(sp.kron(bz0, bz1, format='bsr'), blocksize=(self.degrees[1]+1, self.degrees[1]+1)) 
+                                    for bz0 in sp0.bezier for bz1 in sp1.bezier]
+                
+                refinement_operators = [sp.csc_array(sp.kron(rs0, rs1, format='csc')) 
+                                        for rs0 in sp0.Rs for rs1 in sp1.Rs]
+
+            else: # dense mode
                 refinement_operators = np.kron(self.spaces[0].Rs, self.spaces[1].Rs)
                 bezier_operators = np.kron(self.spaces[0].bezier, self.spaces[1].bezier)
             
             if self.dim==3:
-                
+                sp2 = self.spaces[2]
                 if mode=="sparse":
-                    refinement_operators3d = []
-                    bezier_operators3d = []
-                    for i in range(len(refinement_operators)):
-                        for rs2 in self.spaces[2].Rs:
-                            refinement_operators3d.append(sp.csc_array(sp.kron(refinement_operators[i], rs2, format='csc')))
-                        pass
-                    pass
-                    for i in range(len(bezier_operators)):
-                        for bz2 in self.spaces[2].bezier:
-                            bezier_operators3d.append(sp.bsr_array(sp.kron(bezier_operators[i], bz2, format='bsr'),
-                                                             blocksize=(self.degrees[2]+1, self.degrees[2]+1)))
-                        pass
-                    pass
-                    self.refinement_operators = refinement_operators3d
+                    self.refinement_operators = [sp.csc_array(sp.kron(rsi, rs2, format='csc')) 
+                                                 for rsi in refinement_operators for rs2 in sp2.Rs]
+                    
+                    self.bezier_operators = [sp.bsr_array(sp.kron(bzi, bz2, format='bsr'), blocksize=(self.degrees[2]+1, self.degrees[2]+1)) 
+                                             for bzi in bezier_operators for bz2 in sp2.bezier]
+                    
                 
-                else:
+                else: # dense mode
                     refinement_operators3d = np.kron(refinement_operators, self.spaces[2].Rs)
                     self.refinement_operators = np.asfortranarray(refinement_operators3d)
                     bezier_operators3d = np.kron(bezier_operators, self.spaces[2].bezier)
                     self.bezier_operators = bezier_operators3d
                     
-            else:
+            else: # if self.dim==2
                 self.bezier_operators = bezier_operators
+
                 if mode=="sparse":
                     self.refinement_operators = refinement_operators
                 else:
                     self.refinement_operators = np.asfortranarray(refinement_operators)
+
                 
 
 
@@ -645,6 +668,7 @@ class TensorProductSpace(Space):
     
     def cell_to_basis(self, cell_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray[np.int_]:
         """Returns the indices of the function supported in the given list of cells.
+        A basis function is returned if its support contains a cell in `cell_indices`.
         The "inverse" of basis_to_cell.
         
         :param cell_indices: a int/list/array of indices
@@ -666,10 +690,10 @@ class TensorProductSpace(Space):
         
         grid_shape: tuple[int]=self.mesh.shape
 
-        # 1. Convert flat cell index to (ix, iy) tuple
+        # Convert flat cell index to (ix, iy) tuple
         tensor_idx = np.unravel_index(cell_list, grid_shape)
         
-        # 2. Get 1D basis functions for each dimension
+        # Get 1D basis functions for each dimension
         expanded_basis_1d = []
         for d in range(self.dim):
             b_1d = self.spaces[d].cell_to_basis_indices(tensor_idx[d])
@@ -678,7 +702,7 @@ class TensorProductSpace(Space):
             
             expanded_basis_1d.append(b_1d.reshape(target_shape))
             
-        # 3. Convert nD tensor indices back to flat basis indices
+        # Convert nD tensor indices back to flat basis indices
         # The result has shape (N, p0+1, p1+1, ...)
         flat_basis_nd = np.ravel_multi_index(
             tuple(expanded_basis_1d), 
@@ -686,8 +710,48 @@ class TensorProductSpace(Space):
             mode='raise'
         )
         return flat_basis_nd.reshape(len(cell_list), -1).astype(np.int32)
-        # 4. Flatten the array and return unique basis indices
+        # Flatten the array and return unique basis indices
         #return np.unique(flat_basis_nd)
+
+    def get_children_functions(self, indices: int|list[int]|npt.NDArray[np.int_])->list[npt.NDArray[np.int32]]:
+        """
+        Returns functions that are children of the given functions, given a dyadic refinement of the mesh.
+        Using the inclusion property V^l ⊂ V^{l+1}, a BSpline b^l ∈ V^l can be expressed as a linear combinations
+        of BSplines {b_i^{l+1} ∈ V^{l+1}} with some real coefficients {c_i^{l+1}}: 
+
+        b^l(x) = Σ_i c_i^{l+1} b_i^{l+1}(x).
+
+        This functions returns the indices of the basis functions b_i^{l+1} that have non-zero coefficients in the sum above.
+        
+        """
+        
+        indices = np.atleast_1d(indices)
+        multi_index = np.unravel_index(indices, self.nfuncs_onedim) # does not exist in numba
+        children_funcs = []
+        children_1d = []
+        for d in range(self.dim):
+            # spaces[d].get_children_functions(multi_index[d]) returns a 
+            # list of 1D arrays containing the 1D fine indices.
+            children_1d.append(self.spaces[d].get_children_functions(multi_index[d]))
+
+        children_funcs = []
+        for k in range(len(indices)):
+            # Extract the 1D children for the k-th B-spline across all dimensions
+            # For a 2D spline, this gets c_x and c_y.
+            c_k = [children_1d[d][k] for d in range(self.dim)]
+            
+            # Create a D-dimensional grid of fine indices (the Tensor Product)
+            # indexing='ij' ensures the matrix layout matches numpy's standard unravel/ravel rules.
+            grids = np.meshgrid(*c_k, indexing='ij')
+            
+            # Ravel the D-dimensional fine indices back into 1D flat fine indices
+            flat_children_k = np.ravel_multi_index(tuple(grids), dims=self.nfuncs_nextdim) # does not exist in numba
+            
+            # Flatten the grid into a single 1D array of integers
+            children_funcs.append(flat_children_k.flatten().astype(np.int32))
+            
+        return children_funcs
+
 
     def construct_basis(self):
         """
@@ -733,42 +797,6 @@ class TensorProductSpace(Space):
             self.basis = flat_basis
         return
 
-        # 1. Generate all combinations of 1D function indices
-        # idx_1d = [ [0,1,2,3], [0,1,2,3,4], ... ]
-        idx_1d = [np.arange(s.nfuncs) for s in self.spaces]
-        
-        # Meshgrid creates the tensor topology. Shape becomes (nfuncs_total, dim)
-        grid = np.meshgrid(*idx_1d, indexing='ij')
-        idx_nd = np.stack(grid, axis=-1).reshape(-1, self.dim)
-        
-        # 2. Aggregate the nD properties
-        supports_per_dim = []
-        evals_per_dim = []
-        basis_per_dim = []
-        
-        for d in range(self.dim):
-            space = self.spaces[d]
-            # Get the 1D indices corresponding to this specific dimension 'd'
-            indices_for_dim = idx_nd[:, d]
-            
-            # Fetch and append the 1D properties using fancy indexing
-            supports_per_dim.append(space.supports[indices_for_dim])
-            evals_per_dim.append(space.end_evals[indices_for_dim])
-            basis_per_dim.append(space.local_knots[indices_for_dim])
-            
-        # 3. Stack into the final nD arrays
-        self.basis_supports = self.get_cells(range(self.nfuncs_total))
-        self.basis_end_evals = np.stack(evals_per_dim, axis=1).astype(np.float32)
-        
-        # 4. Handle identical vs mixed degrees for self.basis
-        if np.all(self.degrees == self.degrees[0]):
-            self.basis = np.stack(basis_per_dim, axis=1)
-        else:
-            flat_basis = np.empty((self.nfuncs, self.dim), dtype=object)
-            for d in range(self.dim):
-                flat_basis[:, d] = list(basis_per_dim[d])
-            self.basis = flat_basis
-
     def refine(self, dims: list[int])-> "TensorProductSpace":
         """
         Refine the space by dyadically inserting midpoints in the knot
@@ -805,27 +833,7 @@ class TensorProductSpace(Space):
                 return design_matrix[nnz1, nnz2]
         
     
-    def bezier_extraction_operator(self):
-        """
-        For each dimension, computes the local Bézier extraction operators.
-        The result is saved in a new attribute `self.bezier_extraction_operators`.
-        """
-        self.bezier_extraction_operators = []
-        for space in range(self.spaces):
-            self.bezier_extraction_operator.append(space.bezier_extraction_operator())
-            
-        #return bezier_extraction_operators
     
-    def element_knot_insertion_operators(self):
-        """
-        For each dimension, computes local extraction operators for current knots to the next refinement level.
-        The result is saved in a new attribute `self.insertion_operators`.
-        """
-        self.insertion_operators = []
-        for space in self.spaces:
-            self.insertion_operators.append(space.element_knot_insertion_operator())
-        #return insertion_operators
-
     @staticmethod #does not need to have access to class data or methods
     def compute_projection_matrix(coarse_knots, fine_knots, degrees):
         """
@@ -838,30 +846,31 @@ class TensorProductSpace(Space):
 
         :return: a list of 1D projection matrices corresponding to each parametric dimension
         """
-        matrices = []
-        for fine, coarse, degree in zip(fine_knots, coarse_knots, degrees):
-            coarse = augment_knots(coarse, degree)
-            fine = augment_knots(fine, degree)
-            m = len(fine) - (degree + 1)
-            n = len(coarse) - (degree + 1)
+        pass
+        # matrices = []
+        # for fine, coarse, degree in zip(fine_knots, coarse_knots, degrees):
+        #     coarse = augment_knots(coarse, degree)
+        #     fine = augment_knots(fine, degree)
+        #     m = len(fine) - (degree + 1)
+        #     n = len(coarse) - (degree + 1)
 
-            a = sp.lil_matrix((m, n), dtype=np.float64)
-            fine = np.array(fine, dtype=np.float64)
-            coarse = np.array(coarse, dtype=np.float64)
-            for i in range(m):
-                mu = find_knot_index(fine[i], coarse)
-                b = 1.
-                for k in range(1, degree + 1):
-                    tau1 = coarse[mu - k + 1:mu + 1]
-                    tau2 = coarse[mu + 1:mu + k + 1]
-                    omega = (fine[i + k] - tau1) / (tau2 - tau1)
-                    b = np.append((1 - omega) * b, 0) + np.insert((omega * b), 0, 0)
-                a[i, mu - degree:mu + 1] = b
-            matrices.append(a[degree + 1:-degree - 1, degree + 1:-degree - 1])
+        #     a = sp.lil_matrix((m, n), dtype=np.float64)
+        #     fine = np.array(fine, dtype=np.float64)
+        #     coarse = np.array(coarse, dtype=np.float64)
+        #     for i in range(m):
+        #         mu = find_knot_index(fine[i], coarse)
+        #         b = 1.
+        #         for k in range(1, degree + 1):
+        #             tau1 = coarse[mu - k + 1:mu + 1]
+        #             tau2 = coarse[mu + 1:mu + k + 1]
+        #             omega = (fine[i + k] - tau1) / (tau2 - tau1)
+        #             b = np.append((1 - omega) * b, 0) + np.insert((omega * b), 0, 0)
+        #         a[i, mu - degree:mu + 1] = b
+        #     matrices.append(a[degree + 1:-degree - 1, degree + 1:-degree - 1])
 
-        return matrices
+        # return matrices
 
-    def get_cells(self, basis_function_list: np.ndarray) -> tuple[np.ndarray, dict]:
+    def get_cells(self, basis_functions_list: np.ndarray) -> tuple[npt.NDArray, npt.NDArray]:
         """
         Given a list of indices corresponding to basis functions, return the
         union of the support-cells.
@@ -871,7 +880,7 @@ class TensorProductSpace(Space):
         """
 
         # Ensure input is a numpy array
-        basis_function_list = np.atleast_1d(basis_function_list)
+        basis_function_list = np.atleast_1d(basis_functions_list)
         tensor_idx = np.unravel_index(basis_function_list, self.nfuncs_onedim)
 
         supports = []
@@ -882,124 +891,6 @@ class TensorProductSpace(Space):
 
 
         return cell_supports, self.basis_to_cell(basis_function_list)
-        
-        if len(basis_function_list) == 0:
-            return np.array([], dtype=int), {}
-
-        # 1. Retrieve Geometries
-        # subset_supports shape: (N_subset, dim, 2)
-        subset_supports = self.basis_supports[basis_function_list]
-        # all_cells shape: (N_cells, dim, 2)
-        all_cells = self.mesh.cells
-
-        basis_start = subset_supports[:, :, 0][:, None, :]
-        basis_end   = subset_supports[:, :, 1][:, None, :]
-
-        # Cells: (1, N_cells, dim)
-        cells_start = all_cells[:, :, 0][None, :, :]
-        cells_end   = all_cells[:, :, 1][None, :, :]
-
-        condition_dims = (cells_start + tol >= basis_start) & (cells_end <= basis_end + tol)
-        is_supported_mask = np.all(condition_dims, axis=2)
-
-        valid_cells_mask = np.any(is_supported_mask, axis=0)
-        unique_cells = np.flatnonzero(valid_cells_mask)
-
-        # rows tells how many times a B-spline is supported on the cells, e.g rows=array([0, 1, 1, 1, 1, 2, 2, 2]) means that given B-spline 0's
-        # support spans 1 cell, given B-spline 1 support spans 4 cells given spline 2 support spans 3 cells.
-        # cols tells us which cell is in the support of the B-spline in `row`, e.g cols=array([6, 0, 1, 3, 4, 0, 1, 2]) means that
-        # B-spline 0 is supported on cell 6, B-spline 1 is supported on cells 0,1,3,4 and B-spline 2 is supported on cells 0,1,2.
-        rows, cols = np.nonzero(is_supported_mask)
-
-        # unique rows stores which B-splines are active on the cells, and split_indices tells us where we change spline in `rows`, e.g
-        # it will be split_indices=arrays([0,1,5]) in the example above.
-        unique_rows, split_indices = np.unique(rows, return_index=True)
-        # grouped cells are the indices of cells who are included in the support of B-spline j, e.g
-        # grouped_cells = [array([6]), array([0, 1, 3, 4]), array([0, 1, 2])]
-        grouped_cells = np.split(cols, split_indices[1:]) #
-
-        # Map back to real Basis IDs
-        cells_map = {}
-        for i, row_idx in enumerate(unique_rows):
-            real_basis_id = basis_function_list[row_idx]
-            cells_map[real_basis_id] = grouped_cells[i]
-
-        return unique_cells, cells_map
-
-    
-    
-
-class TensorProductSpace2D(TensorProductSpace):
-
-
-    # def construct_basis(self):
-    #     """
-
-    #     """
-
-    #     knots_u = self.knots[0]
-    #     knots_v = self.knots[1]
-    #     deg_u = self.degrees[0]
-    #     deg_v = self.degrees[1]
-
-    #     lenu = len(knots_u)
-    #     n = lenu - deg_u - 1
-    #     lenv = len(knots_v)
-    #     m = lenv - deg_v - 1
-
-    #     b_splines_end_evals = np.zeros((n * m, 2), dtype=np.intc)
-    #     b_support = np.zeros((n * m, self.dim, 2))
-
-    #     index = 0
-    #     for j in range(m):
-    #         for i in range(n):
-    #             b_support[index] = [[knots_u[i], knots_u[i + deg_u + 1]], [knots_v[j], knots_v[j + deg_v + 1]]]
-    #             offset_u = (i + deg_u + 2)
-    #             offset_v = (j + deg_v + 2)
-    #             b_splines_end_evals[index] = [lenu == offset_u, lenv == offset_v]
-
-    #             index += 1
-    #     self.basis_supports = b_support
-    #     self.basis_end_evals = b_splines_end_evals
-    #     self.nfuncs = n * m
-    #     self.dim_u = n
-    #     self.dim_v = m
-    #     self.nfuncs_onedim = [n, m]
-    #     self.basis = [0]*(n * m)
-
-    def refine(self) -> tuple["TensorProductSpace2D", np.ndarray, list]:
-        """
-        Refine the space by dyadically inserting midpoints in the knot
-        vectors, and computing the knot-insertion
-        matrix (the projection matrix form coarse to fine space).
-        
-        :return: refined TensorProductSpace and a projection matrix
-        """
-
-        coarse_knots = self.knots
-        fine_knots = [insert_midpoints(knot_vector, degree) for knot_vector, degree in zip(self.knots, self.degrees)]
-
-        projection_onedim = self.compute_projection_matrix(coarse_knots, fine_knots, self.degrees)
-        fine_space = TensorProductSpace2D(fine_knots, self.degrees, self.dim)
-
-        return fine_space, projection_onedim
-
-
-def insert_midpoints(knots):
-    """
-    Inserts midpoints in all interior knot intervals of a p+1 regular knot
-    vector.
-
-    :param knots: p + 1 regular knot vector to be refined
-    :param p: spline degree
-    :return: refined_knots
-    """
-
-    knots = np.array(knots, dtype=np.float64)
-    unique_knots = np.unique(knots)
-    midpoints = (unique_knots[:-1] + unique_knots[1:]) / 2.
-
-    return np.sort(np.concatenate((knots, midpoints)))
 
 
 
