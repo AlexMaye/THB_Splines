@@ -6,6 +6,7 @@ import scipy.sparse as sp
 from scipy.interpolate import BSpline, NdBSpline
 from THBSplines.src.cartesian_mesh import CartesianMesh
 from numba import jit
+from functools import reduce
 
 #@jit(nopython=True)
 def _bezier_extraction_impl(p: int, knots: npt.ArrayLike)->npt.NDArray[np.float64]:
@@ -544,6 +545,7 @@ class TensorProductSpace():
     def __init__(self, dim: int, univariate_spaces: list[UnivariateSplineSpace]):
         """
         Represents ONE flat level in the THB hierarchy.
+        The underlying mesh is never explicitly formed as it can become expensive. 
 
         :param knots: a np.ndarray of knot vectors 
         :param degrees: a np.ndarray of degrees corresponding to each parametric dimension
@@ -551,7 +553,7 @@ class TensorProductSpace():
         """
         assert len(univariate_spaces) == dim
         assert dim<=3, "Dimensions higher than 3 are not supported."
-        mode = "sparse" #"dense"
+        # mode = "sparse" #"dense"
         self.dim: int = dim
         self.spaces: list[UnivariateSplineSpace] = univariate_spaces
         self.degrees: npt.NDArray[np.int_] = np.array([space.degree for space in self.spaces])
@@ -559,11 +561,12 @@ class TensorProductSpace():
         self.nfuncs_onedim: npt.NDArray[np.int32] = np.array([space.nfuncs for space in self.spaces], dtype=np.int32)
         self.nfuncs_nextdim = self.nfuncs_onedim + np.array([len(np.where(self.spaces[d].knots[1:]>self.spaces[d].knots[:-1])[0]) for d in range(self.dim)])
         self.nfuncs_total: int = np.prod(self.nfuncs_onedim)
-        self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
+        # self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
+        self.mesh_shape: tuple[int] = tuple([space.n_cells for space in self.spaces])
         self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
-        self.basis_indices_supports = self._cell_to_basis(np.arange(self.mesh.nelems, dtype=np.int32))
+        self.basis_indices_supports = self._cell_to_basis(np.arange(np.prod(self.mesh_shape), dtype=np.int32))
         
-        self._set_bezier_and_refinements(mode=mode)
+        # self._set_bezier_and_refinements(mode=mode)
 
     def _set_bezier_and_refinements(self, mode: str="sparse"):
         """Initialises the attributes `self.refinement_operators` and `self.bezier_operators`, either with dense
@@ -621,8 +624,6 @@ class TensorProductSpace():
                     self.refinement_operators = np.asfortranarray(refinement_operators)
 
                 
-
-
     def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray:
         """
         Returns the indices of cells in the support of the passed basis
@@ -645,7 +646,7 @@ class TensorProductSpace():
             print('No basis list was provided in basis_to_cell.')
             return np.array([], dtype=np.int32)
         
-        #grid_shape = self.mesh.shape
+        #grid_shape = self.mesh_shape
         tensor_idx = np.unravel_index(basis_indices, self.nfuncs_onedim)
         cells_1d = []
         for d in range(self.dim):
@@ -660,7 +661,7 @@ class TensorProductSpace():
             # Create the Cartesian product of these 1D cell arrays
             mesh_grids = np.meshgrid(*grids_1d, indexing='ij')
             
-            flat_cells = np.ravel_multi_index(tuple(mesh_grids), self.mesh.shape)
+            flat_cells = np.ravel_multi_index(tuple(mesh_grids), self.mesh_shape)
             
             nd_cells_list.append(flat_cells.ravel())
             
@@ -688,7 +689,7 @@ class TensorProductSpace():
             print('No cell list was provided in cell_to_basis().')
             return np.array([], dtype=np.int32)
         
-        grid_shape: tuple[int]=self.mesh.shape
+        grid_shape: tuple[int]=self.mesh_shape
 
         # Convert flat cell index to (ix, iy) tuple
         tensor_idx = np.unravel_index(cell_list, grid_shape)
@@ -751,6 +752,29 @@ class TensorProductSpace():
             children_funcs.append(flat_children_k.flatten().astype(np.int32))
             
         return children_funcs
+    
+    def get_refinement_operator(self, index: int):
+        """
+        Computes the kronecker product of refinement operators given a global index
+        """
+        indices = np.unravel_index(index, shape=self.mesh_shape)
+        
+        matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
+        if not matrices:
+            return None
+        # Nothing happens if the list only has one element: a numpy array is kept.
+        kron_product = reduce(lambda x, y: sp.kron(x,y,format='csc'), matrices)
+        return sp.csc_array(kron_product)
+
+    def get_bezier_operator(self, index: int):
+        indices = np.unravel_index(index, shape=self.mesh_shape)
+        
+        matrices = [space.bezier[idx] for space, idx in zip(self.spaces, indices)]
+        if not matrices:
+            return None
+        kron_product = reduce(lambda x, y: sp.kron(x,y,format='bsr'), matrices)
+        return sp.bsr_array(kron_product, blocksize = (self.degrees[-1]+1, self.degrees[-1]+1))
+        
 
 
     def construct_basis(self):
@@ -904,8 +928,6 @@ if __name__ == '__main__':
     dim = len(knots)
 
     T = TensorProductSpace(knots, d, dim)
-    #T.construct_basis
-    print(T.mesh.cells)
-    print(T.cell_areas)
+    
 
     
