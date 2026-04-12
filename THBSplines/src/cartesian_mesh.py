@@ -45,7 +45,7 @@ class CartesianMesh():
         assert 0<self.dim<4, "Only meshes in up to three dimensions are currently supported"
         self.cells = self._compute_cells()
         self.nelems = len(self.cells)
-        self.cell_areas = np.prod(np.diff(self.cells).reshape(-1, self.dim), axis=1)
+        # self.cell_areas = np.prod(np.diff(self.cells).reshape(-1, self.dim), axis=1)
         self.shape = tuple([len(knot)-1 for knot in self.knots]) 
 
     def _compute_cells(self) -> np.ndarray:
