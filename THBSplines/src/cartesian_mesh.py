@@ -38,7 +38,7 @@ class CartesianMesh():
         :param parametric_dimension: number of parametric directions
         """
         assert len(knots)==parametric_dimension, 'Dimension and knots do not match.'
-        self.knots = [np.sort(np.unique(knot_v)) for knot_v in knots]
+        self.knots = [np.unique(knot_v) for knot_v in knots]
         for knot_v in self.knots:
             assert len(knot_v)>1, 'Given mesh is degenerate.'
         self.dim = parametric_dimension
