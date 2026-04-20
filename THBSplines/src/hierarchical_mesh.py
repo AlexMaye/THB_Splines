@@ -1,9 +1,9 @@
 import numpy as np
-from THBSplines.src.cartesian_mesh import CartesianMesh
-from scipy.spatial import KDTree
+#from THBSplines.src.cartesian_mesh import CartesianMesh
+#from scipy.spatial import KDTree
 from collections import deque
 import numpy.typing as npt
-from numba import jit
+import itertools
 
 def sorted_isin(ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
         """`np.isin` when `ar2` is sorted.
@@ -99,7 +99,8 @@ class HierarchicalMesh():
     def __init__(self, knots: list[npt.NDArray]):
         dim = len(knots)
         assert dim>0
-
+        _, mults = np.unique(knots[0], return_counts=True)
+        self.p = mults[0]-1
         self.one_d_indices: dict[int, list[npt.NDArray]] = {0: [np.unique(knot) for knot in knots]}
         #self.meshes: list[CartesianMesh] = [CartesianMesh(knots, dim)]
         self.meshes_shape: dict[int, list[npt.NDArray[np.int32]]] = {0: np.array([len(knot)-1 for knot in self.one_d_indices[0]], dtype=np.int32)}
@@ -192,28 +193,34 @@ class HierarchicalMesh():
         #fine_mesh: CartesianMesh = coarse_mesh.refine() # refine method of CartesianMesh
         #self.meshes.append(fine_mesh)
         coarse_shape: npt.NDArray[np.int32] = self.meshes_shape[coarse_level]
-        fine_shape = 2*coarse_shape
-        self.meshes_shape[fine_level] = fine_shape
+        fine_shape: npt.NDArray[np.int32] = 2*coarse_shape
+        
         num_fine_cells = np.prod(fine_shape)
         self.nlevels += 1
-        self.one_d_indices[fine_level] = [refine_1d(knot, n_times=1) for knot in self.one_d_indices[coarse_level]]
-        self.nodes[fine_level] = []
 
-        # Initialise new attributes
-        self._aelem_level_set[fine_level] = set()
-        self._delem_level_set[fine_level] = set()
-        self.aelem_level[fine_level] = np.array([], dtype=self.aelem_level[coarse_level].dtype)
-        self.delem_level[fine_level] = np.array([], dtype=self.delem_level[coarse_level].dtype)
-        self.nel_per_level[fine_level]=0
-        # self.cell_area_per_level[fine_level] = fine_mesh.cell_areas
-
-        f_flat_indices = np.arange(num_fine_cells, dtype=np.uint32)
+        f_flat_indices = np.arange(num_fine_cells, dtype=np.int32)
         f_multi_indices: tuple[npt.NDArray[np.int_]] = np.unravel_index(f_flat_indices, tuple(fine_shape))
 
         c_multi_indices = tuple(idx//2 for idx in f_multi_indices)
 
         parent_flat_indices = np.ravel_multi_index(c_multi_indices, tuple(coarse_shape))
         coarse_nodes = self.nodes[coarse_level]
+        
+
+        # Initialise new attributes
+        self.meshes_shape[fine_level] = fine_shape
+        self.one_d_indices[fine_level] = [refine_1d(knot, n_times=1) for knot in self.one_d_indices[coarse_level]]
+        self.nodes[fine_level] = []
+        self._aelem_level_set[fine_level] = set()
+        self._delem_level_set[fine_level] = set()
+        self.aelem_level[fine_level] = np.array([], dtype=self.aelem_level[coarse_level].dtype)
+        self.delem_level[fine_level] = np.array([], dtype=self.delem_level[coarse_level].dtype)
+        self.nel_per_level[fine_level]=0
+
+        # self.cell_area_per_level[fine_level] = fine_mesh.cell_areas
+
+        
+        # Create a new node for each cell in the new level.
         for f_idx, p_idx in zip(f_flat_indices, parent_flat_indices):
             parent_node = coarse_nodes[p_idx]
 
@@ -242,12 +249,26 @@ class HierarchicalMesh():
         while queue:
             # Identify a cell that needs to be refined
             node: CellNode = queue.popleft()
-            # If the cell's parent is not refined
+            # If the cell's parent exists and is not refined
             if node.parent and not node.parent.is_refined:
                 # Add the parent node to the refinement list
                 nodes_to_refine.add(node.parent)
-                # Check if its parents need to be refined as well
+                # Check if its parent needs to be refined as well
                 queue.append(node.parent)
+            pass
+
+            # Check neighbours' parents
+            if node.level>0:
+                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.p)
+                for n_idx in neighbour_indices:
+                    neighbour_node = self.nodes[node.level][n_idx]
+                    neighbour_parent = neighbour_node.parent
+                    
+                    if (neighbour_parent and not neighbour_parent.is_refined and neighbour_parent not in nodes_to_refine):
+                        nodes_to_refine.add(neighbour_parent)
+                        queue.append(neighbour_parent)
+                    pass
+                pass
             pass
         pass
 
@@ -480,6 +501,74 @@ class HierarchicalMesh():
         # Refine
         self.refine(marked_cells, at_level=level)
 
+    def _get_neighbour_indices_all_directions(self, level:int, index:int, buffer_width=1)->list[int]:
+        """
+        Finds the 1D indices of all spatial neighbors (including diagonals) 
+        for a cell at a specific level.
+        """
+        shape = self.meshes_shape[level]
+        # Convert 1D index to N-D coordinates
+        coords = np.unravel_index(index, shape)
+        neighbors = []
+        
+        # Generate offsets for all surrounding cells [-1, 0, 1] in all dimensions
+        offsets = list(itertools.product(range(-buffer_width, buffer_width+1), repeat=self.dim))
+        
+        for offset in offsets:
+            # Skip the cell itself
+            if all(o == 0 for o in offset):
+                continue
+                
+            n_coords = tuple(c + o for c, o in zip(coords, offset))
+            
+            # Check if neighbor coordinates are within the mesh boundaries
+            if all(0 <= c < s for c, s in zip(n_coords, shape)):
+                n_idx = np.ravel_multi_index(n_coords, shape)
+                neighbors.append(int(n_idx))
+                
+        return neighbors
+    
+    def _get_neighbour_indices(self, level:int, index:int, p:int)->list[int]:
+        """
+        Finds `p` neighbours of cell `index` along the main directions, and only 1 across the diagonal.
+        """
+
+        shape = self.meshes_shape[level]
+        coords = np.unravel_index(index, shape)
+        neighbors = []
+        
+        # Define the bounding box of potential neighbours
+        # We check up to distance p in all directions, then filter.
+        r = range(-p, p + 1)
+        for offset in itertools.product(r, repeat=self.dim):
+            # Ignore current cell
+            if all(o == 0 for o in offset):
+                continue
+                
+            # --- The Logic Filter ---
+            abs_offsets = [abs(o) for o in offset]
+            max_offset = max(abs_offsets)
+            num_nonzero = sum(1 for o in abs_offsets if o > 0)
+            
+            is_valid = False
+            
+            # Immediate neighbourhood (includes diagonals)
+            if max_offset <= 1:
+                is_valid = True
+                
+            # Cardinal extension (p cells away, but only along one axis)
+            elif num_nonzero == 1 and max_offset <= p:
+                is_valid = True
+                
+            if is_valid:
+                n_coords = tuple(c + o for c, o in zip(coords, offset))
+                # Check boundaries
+                if all(0 <= c < s for c, s in zip(n_coords, shape)):
+                    n_idx = np.ravel_multi_index(n_coords, shape)
+                    neighbors.append(int(n_idx))
+                    
+        return neighbors
+
     def plot_cells(self, figsize:tuple=(10,5), return_fig = False) -> None:
         """
         Plots the hierarchical mesh, and optionally returns the figure handle.
@@ -490,9 +579,32 @@ class HierarchicalMesh():
         """
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
+        from matplotlib.colors import ListedColormap
 
         fig, ax = plt.subplots(figsize=figsize)
-        colors = plt.get_cmap('tab10', max(10, self.nlevels))
+        colours = ['#7F7F7F',
+                    '#C7C7C7',
+                    '#1F77B4',
+                    '#AEC7E8',
+                    '#2CA02C',
+                    '#98DF8A',
+                    "#FF5E0E",
+                    '#FFBB78',
+                    '#D62728',
+                    '#FF9896',
+                    '#9467BD',
+                    '#C5B0D5',
+                    '#BCBD22',
+                    '#DBDB8D',
+                    '#E377C2',
+                    '#F7B6D2',
+                    '#8C564B',
+                    '#C49C94',
+                    '#17BECF',
+                    '#9EDAE5']
+        custom_cmap = ListedColormap(colours)
+        colors=custom_cmap(range(len(colours))) 
+        #colors = plt.get_cmap('tab20c', max(20, self.nlevels))
 
         if getattr(self, 'dim', 1) not in [1,2]:
             print('Dimensions 3 and higher are not displayed.')
@@ -519,7 +631,7 @@ class HierarchicalMesh():
                     
                     rect = plt.Rectangle((xmin, -height/2), width, height,
                                          edgecolor='black',
-                                         facecolor=colors(level),
+                                         facecolor=colors[level],
                                          alpha=0.6,
                                          linewidth=1.5)
                     ax.add_patch(rect)
@@ -540,7 +652,7 @@ class HierarchicalMesh():
                     # Draw a colored rectangle for the 2D element
                     rect = plt.Rectangle((xmin, ymin), width, height,
                                          edgecolor='black',
-                                         facecolor=colors(level),
+                                         facecolor=colors[level],
                                          alpha=0.6,
                                          linewidth=1.5)
                     ax.add_patch(rect)
@@ -558,7 +670,7 @@ class HierarchicalMesh():
             ax.set_ylabel('Y')
 
         if self.nlevels > 1:
-            handles = [mpatches.Patch(color=colors(l), alpha=0.6, label=f'Level {l}') 
+            handles = [mpatches.Patch(color=colors[l], alpha=0.6, label=f'Level {l}') 
                        for l in range(self.nlevels)]
             ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left')
 
