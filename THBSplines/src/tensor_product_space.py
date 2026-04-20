@@ -8,7 +8,7 @@ from THBSplines.src.cartesian_mesh import CartesianMesh
 from numba import jit
 from functools import reduce
 
-#@jit(nopython=True)
+@jit(nopython=True)
 def _bezier_extraction_impl(p: int, knots: npt.ArrayLike)->npt.NDArray[np.float64]:
     """ Based on the paper 'Isogeometric finite element data structures based on Bézier extraction of T-splines'
       ( https://doi.org/10.1002/nme.2968), algorithm 1."""
@@ -62,7 +62,7 @@ def _bezier_extraction_impl(p: int, knots: npt.ArrayLike)->npt.NDArray[np.float6
     pass
     return C
 
-#@jit(nopython=True)
+@jit(nopython=True)
 def _oslo1(p: int, coarsekn: npt.ArrayLike, finekn: npt.ArrayLike, cf: int, rf: int)->npt.NDArray[np.float64]:
     """ 
     From [Multi-level Bézier extraction for hierarchical local refinement of Isogeometric Analysis](https://doi.org/10.1016/j.cma.2017.08.017),
@@ -83,8 +83,14 @@ def _oslo1(p: int, coarsekn: npt.ArrayLike, finekn: npt.ArrayLike, cf: int, rf: 
         denom: npt.ArrayLike = t2-t1
         x: npt.ArrayLike = finekn[rf+k+1]
         w: npt.NDArray[np.float64] = np.zeros(k+1) #k+1=len(t1)
-        nnz: npt.NDArray[np.bool_] = np.abs(denom)>1e-10
-        w[nnz] = (x-t1)[nnz]/denom[nnz]
+        for i in range(k+1):
+            d = denom[i]
+            if abs(d)>1e-15:
+                w[i] = (x-t1[i])/d
+            else:
+                w[i]=0.
+        #nnz: npt.NDArray[np.bool_] = np.abs(denom)>1e-15
+        #w[nnz] = (x-t1)[nnz]/denom[nnz]
         # with np.errstate(divide='ignore', invalid='ignore'):
         #     w = (x - t1) / denom
         #     w = np.nan_to_num(w)
@@ -95,7 +101,7 @@ def _oslo1(p: int, coarsekn: npt.ArrayLike, finekn: npt.ArrayLike, cf: int, rf: 
 
     return b 
 
-#@jit(nopython=True)
+@jit(nopython=True)
 def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.ndarray:
     """
     From [Multi-level Bézier extraction for hierarchical local refinement of Isogeometric Analysis](https://doi.org/10.1016/j.cma.2017.08.017),
@@ -112,16 +118,19 @@ def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.n
     max_cf = len(coarsekn) - 2 
     # all_cfs = np.clip(all_cfs, p, max_cf)[:m-p-1]
     all_cfs = np.minimum(max_cf, np.maximum(all_cfs, p))[:m-p-1]
-    cf = all_cfs[p] 
+    #cf = all_cfs[p] 
+    cf=p
     
     while rf<m-p-1:
         mult = 1
-        while ((rf+mult<m)and(finekn[rf+mult] == finekn[rf])):
+        while ((rf+mult<m)and(abs(finekn[rf+mult]- finekn[rf])<1e-15)):
             mult+=1
         pass
         
         lastcf = cf
-        cf = all_cfs[rf] 
+        #cf = all_cfs[rf] 
+        while(coarsekn[cf+1]<=finekn[rf]):
+            cf=cf+1
         
         if e>0:
             offs = cf-lastcf
@@ -563,6 +572,7 @@ class TensorProductSpace():
         self.nfuncs_total: int = np.prod(self.nfuncs_onedim)
         # self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
         self.mesh_shape: tuple[int] = tuple([space.n_cells for space in self.spaces])
+        self.next_mesh_shape: tuple[int] = tuple([space.Rs.shape[0] for space in self.spaces])
         self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
         self.basis_indices_supports = self._cell_to_basis(np.arange(np.prod(self.mesh_shape), dtype=np.int32))
         
@@ -698,17 +708,24 @@ class TensorProductSpace():
         expanded_basis_1d = []
         for d in range(self.dim):
             b_1d = self.spaces[d].cell_to_basis_indices(tensor_idx[d])
+            # if cell_list has elements [a,b,...,n] and p=2, this looks like array([[a_1,a_2,a_3], [b_1, b_2, b_3],...])
             target_shape = [len(cell_list)] + [1] * self.dim
+            # = [len(cell_list), self.dim, self.dim]
             target_shape[d + 1] = self.spaces[d].degree + 1
+            # (d=0)  = [len(cell_list), p0+1, self.dim]
+            # (d=1) = [len(cell_list), self.dim, p1+1]
             
             expanded_basis_1d.append(b_1d.reshape(target_shape))
+            # in 2d, this produces a list of column vectors for the first entry,
+            # and a list of row vectors for the second entry.
             
         # Convert nD tensor indices back to flat basis indices
         # The result has shape (N, p0+1, p1+1, ...)
         flat_basis_nd = np.ravel_multi_index(
             tuple(expanded_basis_1d), 
             dims=self.nfuncs_onedim,
-            mode='raise'
+            mode='raise',
+            order='C' #last dimension varies the fastest
         )
         return flat_basis_nd.reshape(len(cell_list), -1).astype(np.int32)
         # Flatten the array and return unique basis indices
@@ -742,7 +759,6 @@ class TensorProductSpace():
             c_k = [children_1d[d][k] for d in range(self.dim)]
             
             # Create a D-dimensional grid of fine indices (the Tensor Product)
-            # indexing='ij' ensures the matrix layout matches numpy's standard unravel/ravel rules.
             grids = np.meshgrid(*c_k, indexing='ij')
             
             # Ravel the D-dimensional fine indices back into 1D flat fine indices
@@ -757,7 +773,7 @@ class TensorProductSpace():
         """
         Computes the kronecker product of refinement operators given a global index
         """
-        indices = np.unravel_index(index, shape=self.mesh_shape)
+        indices = np.unravel_index(index, shape=self.next_mesh_shape)
         
         matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
         if not matrices:

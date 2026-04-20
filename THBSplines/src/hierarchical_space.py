@@ -84,7 +84,11 @@ class HierarchicalSpace():
 
         # Functions of level l that are supported on Ω^l_{-}
         self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {0: np.array([], dtype=np.int32)}
+        # Active functions that are NOT supported on Ω^l_{-}
         self.truly_active: dict[int, npt.NDArray[np.int32]] = {0: np.arange(self.level_spaces[0].nfuncs_total, dtype=np.int32)}
+
+        # 0: inactive, 1: truly_active, 2: Bl_minus
+        self.function_status: dict[int, np.NDArray[np.uint8]] = {0: np.ones_like(self.active_functions[0], dtype=np.int8)}
 
         l0_space = self.level_spaces[0]
         n_funcs0 = l0_space.nfuncs_total
@@ -96,9 +100,11 @@ class HierarchicalSpace():
         # self.get_all_active_functions_on_cell
         
 
-    def refine(self, marked_cells: list[int], level: int, axes=None):
+    def refine(self, marked_cells: list[int], level: int, axes=None, incremental=False):
         """
         Refines the specified cells at a given level.
+
+        if `incremental` is set to `True`, this function is a bit slower.
         
         :param marked_cells: List of flat cell indices at 'level' to refine.
         :param level: The level at which the marked_cells currently exist.
@@ -121,37 +127,38 @@ class HierarchicalSpace():
             pass
         pass
          
-
-        # Keep a copy of cells that were already refined, so that they don't get
-        # analysed an additional time when active functions are updated.
-        # The deepcopy is needed because the content must not be overwritten 
-        # by the call to self.mesh.refine() later on.
-        previously_inactive_cells = deepcopy(self.hmesh.delem_level)
+        if incremental:
+            # Keep a copy of cells that were already refined, so that they don't get
+            # analysed an additional time when active functions are updated.
+            # The deepcopy is needed because the content must not be overwritten 
+            # by the call to self.mesh.refine() later on.
+            previously_inactive_cells = deepcopy(self.hmesh.delem_level)
 
         # Update the physical mesh topology
         # This includes refining the current finest mesh, creating new CellNodes if necessary, 
         # and updating active/deactivated cells
         self.hmesh.refine(marked_cells=marked_cells, at_level=level)
         
-    
-        # Make sure that we are not refining an already refined cell.
-        if level<current_level:
-            marked_cells= np.setdiff1d(marked_cells, previously_inactive_cells[level])
-            if marked_cells.size==0:
-                return
-        # marked_cells = marked_cells[~already_refined]
+        if incremental:
+            # Make sure that we are not refining an already refined cell.
+            if level<current_level:
+                marked_cells= np.setdiff1d(marked_cells, previously_inactive_cells[level])
+                if marked_cells.size==0:
+                    return
+            # marked_cells = marked_cells[~already_refined]
 
-        for l in range(level+1):
-            cells = self.hmesh.get_parent_at_level(start_level=level, stop_level=l, marked_cells_at_start_level=marked_cells)
-            # Don't work with cells that were already refined, i.e the cells that were
-            # inactive during the previous call of refine
-            if l<current_level:
-                cells = np.setdiff1d(cells, previously_inactive_cells[l], assume_unique=False)
-            if cells.size!=0:
-                self._update_active_functions_incremental(marked_cells=cells, level=l)
         
-       
-        # self._update_active_functions()
+            for l in range(level+1):
+                cells = self.hmesh.get_parent_at_level(start_level=level, stop_level=l, marked_cells_at_start_level=marked_cells)
+                # Don't work with cells that were already refined, i.e the cells that were
+                # inactive during the previous call of refine
+                if l<current_level:
+                    cells = np.setdiff1d(cells, previously_inactive_cells[l], assume_unique=False)
+                if cells.size!=0:
+                    self._update_active_functions_incremental(marked_cells=cells, level=l)
+            
+        else:
+            self._update_active_functions()
         
 
     def _add_level(self, axes=None):
@@ -174,6 +181,52 @@ class HierarchicalSpace():
         # self.bezier_operators[l+1] = self.level_spaces[l+1].bezier_operators
         # self.refinement_operators[l+1] = self.level_spaces[l+1].refinement_operators
 
+    def _update_active_functions(self):
+        """
+        Updates the set of active and deactivated functions.
+        A function of level l is active if its supports intersects at least one active cell of level l. 
+        It is inactive otherwise.
+        A cell is said to be active if it was not refined.
+        """
+        # Dictionaries for each refinement level
+        self.active_functions: dict[int, npt.NDArray[np.int32]] = {}
+        self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {}
+        self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {}
+        self.truly_active: dict[int, npt.NDArray[np.int32]] = {}
+        
+        for l in range(self.nlevels):
+            space_l: TensorProductSpace = self.level_spaces[l]
+            nfuncs = space_l.nfuncs_total
+            # Quick lookup dictionary for level l cells
+            nodes_l: list[CellNode] = self.hmesh.nodes[l]
+            
+            is_active_mask: npt.NDArray[np.bool_] = np.zeros(nfuncs, dtype=bool)
+            is_minus_mask: npt.NDArray[np.bool_] = np.zeros_like(is_active_mask)
+
+            for cell_idx, node in enumerate(nodes_l):
+                # This loop is relatively fast because many cells are skipped, as many are inactive.
+                cell_active: bool = node.is_active
+                parent_active: bool = node.parent.is_active if node.parent else False
+
+                if cell_active or parent_active:
+                    affected_funcs: npt.NDArray[np.int_] = space_l.cell_to_basis(cell_idx)
+                    if cell_active:
+                        is_active_mask[affected_funcs]=True
+                    if parent_active:
+                        is_minus_mask[affected_funcs]=True
+                        
+                    pass
+                pass
+            pass
+            
+            all_indices = np.arange(nfuncs, dtype=np.int32)
+            self.active_functions[l] = all_indices[is_active_mask]
+            self.deactivated_functions[l]=all_indices[~is_active_mask]
+            self.Bl_minus[l]=all_indices[is_minus_mask&is_active_mask]
+            self.truly_active[l] = all_indices[is_active_mask&(~is_minus_mask)]
+            
+        pass
+
     def _update_active_functions_incremental(self, marked_cells: npt.NDArray[np.int_], level: int):
         """Updates active and deactivated functions when `marked_cells` at `level` have been refined to `level`+1. 
         
@@ -193,8 +246,8 @@ class HierarchicalSpace():
         for b_idx in impacted_basis_l:
             support: npt.NDArray[np.int_] = space_l.basis_to_cell(b_idx)
             
-            num_removed = self._my_isin(support, marked_cells).sum()
-            self.active_cell_counts[level][b_idx] = max(0, self.active_cell_counts[level][b_idx]-num_removed)
+            num_removed = np.isin(support, marked_cells).sum()
+            self.active_cell_counts[level][b_idx] = self.active_cell_counts[level][b_idx]-num_removed
         pass
         function_stays = self.active_cell_counts[level]>0
         self.active_functions[level] = np.flatnonzero(function_stays).astype(np.int32)
@@ -227,92 +280,54 @@ class HierarchicalSpace():
                 #children_cells.extend([child.index for child in nodes_l[c].children])
             pass
             
-            # children_cells = np.array(children_cells)
-            # all functions that are supported on the newly refined cells
-            impacted_basis_lp1 = np.unique(np.concatenate(space_lp1.cell_to_basis(children_cells.ravel())))
-            
-            # If this is a newly created level, initialize counts to 0
+            # all functions that are supported on the newly refined cells, with multiplicity
+            impacted_basis_raw = np.concatenate(space_lp1.cell_to_basis(children_cells.ravel()))
+
+            # The second argument counts how many times each basis function is supported on a newly refined cell.
+            # This is equivalent to counting the number of active cells in a basis function's support.
+            impacted_basis_lp1, num_added_counts = np.unique(impacted_basis_raw, return_counts=True)
+
+            # If this is a newly created level, initialise counts to 0
             if next_level not in self.active_cell_counts:
                 self.active_cell_counts[next_level] = np.zeros(space_lp1.nfuncs_total, dtype=self.active_cell_counts[0].dtype)
             pass
-            Bl_minus = []
+
+            # Add the number of active cells in the supports of basis functions
+            self.active_cell_counts[next_level][impacted_basis_lp1]+=num_added_counts.astype(np.uint16)
+
+            if next_level not in self.function_status:
+                # All are deactivated by default.
+                self.function_status[next_level] = np.zeros(space_lp1.nfuncs_total, dtype=np.int8)
+
             mesh_nodes_l1 = self.hmesh.nodes[next_level]
+
             for b_idx in impacted_basis_lp1:
+                
                 support = space_lp1.basis_to_cell(b_idx)
-                # How many of the new children are in this basis support?
-                num_added = np.isin(support, children_cells).sum()
-                self.active_cell_counts[next_level][b_idx] += num_added
-                for cell in support:
-                    if mesh_nodes_l1[cell].parent.is_active:
-                        Bl_minus.append(b_idx)
-                        break #break if at least one support cell has an active parent.
-                    pass
-                pass
+                
+                has_active_parents = any(mesh_nodes_l1[cell].parent.is_active for cell in support)
+                self.function_status[next_level][b_idx] = 2 if has_active_parents else 1
             pass
 
-            Bl_minus = np.array(Bl_minus)
 
             function_stays = self.active_cell_counts[next_level]>0
             self.active_functions[next_level] = np.flatnonzero(function_stays).astype(np.int32)
-            #print(f"active functions = {self.active_functions}")
             self.deactivated_functions[next_level] = np.flatnonzero(~function_stays).astype(np.int32)
-            self.Bl_minus[next_level] = np.intersect1d(np.union1d(Bl_minus, self.Bl_minus[next_level]), self.active_functions[next_level], assume_unique=True)
-            self.truly_active[next_level] = np.setdiff1d(self.active_functions[next_level], self.Bl_minus[next_level], assume_unique=True)
-            #print(f"active functions = {self.active_functions}")
+
+            truly_active_mask = (self.function_status[next_level]==1)&function_stays
+            bl_minus_mask = (self.function_status[next_level]==2)&function_stays
+            self.truly_active[next_level] = np.flatnonzero(truly_active_mask).astype(np.int32)
+            self.Bl_minus[next_level] = np.flatnonzero(bl_minus_mask).astype(np.int32)
         pass
     pass
-
-    def _update_active_functions(self):
-        """
-        Updates the set of active and deactivated functions.
-        A function of level l is active if its supports intersects at least one active cell of level l. 
-        It is inactive otherwise.
-        A cell is said to be active if it was not refined.
-        """
-        # Dictionaries for each refinement level
-        self.active_functions: dict[int, npt.NDArray[np.int32]] = {}
-        self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {}
-        self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {}
-        self.truly_active: dict[int, npt.NDArray[np.int32]] = {}
-        
-        for l in range(self.nlevels):
-            space_l: TensorProductSpace = self.level_spaces[l]
-            nfuncs = space_l.nfuncs_total
-            # Quick lookup dictionary for level l cells
-            nodes_l: list[CellNode] = self.hmesh.nodes[l]
-            
-            is_active_mask: npt.NDArray[np.bool_] = np.zeros(nfuncs, dtype=bool)
-            is_minus_mask: npt.NDArray[np.bool_] = np.zeros_like(is_active_mask)
-
-            for cell_idx, node in enumerate(nodes_l):
-                cell_active: bool = node.is_active
-                parent_active: bool = node.parent.is_active if node.parent else False
-
-                if cell_active or parent_active:
-                    affected_funcs: npt.NDArray[np.int_] = space_l.cell_to_basis(cell_idx)
-                    if cell_active:
-                        is_active_mask[affected_funcs]=True
-                    if parent_active:
-                        is_minus_mask[affected_funcs]=True
-                        
-                    pass
-                pass
-            pass
-            
-            all_indices = np.arange(nfuncs, dtype=np.int32)
-            self.active_functions[l] = all_indices[is_active_mask]
-            self.deactivated_functions[l]=all_indices[~is_active_mask]
-            self.Bl_minus[l]=all_indices[is_minus_mask&is_active_mask]
-            self.truly_active[l] = all_indices[is_active_mask&(~is_minus_mask)] #np.setdiff1d(self.active_functions[l], self.Bl_minus[l], assume_unique=True)
-            
-        pass
 
     def _my_isin(self, ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
         """`np.isin` when `ar2` is sorted.
         No checks are performed to ensure this.
         """
-        ar1 = np.array(ar1)
+        ar1 = np.atleast_1d(ar1)
         ar2 = np.atleast_1d(ar2)
+        return np.isin(ar1, ar2, assume_unique=False)
         if len(ar2)<2:
             # searchsorted fails for short arrays
             return np.isin(ar1, ar2)
@@ -347,23 +362,23 @@ class HierarchicalSpace():
         - indices of the relevant columns
         - number of columns of the original refinement operator
         """
-        assert l>0, "l has to be positive, as the returned truncation matrix goes from level `l-1` to `l`."
+        assert l>=0, "l has to be positive, as the returned truncation matrix goes from level `l-1` to `l`."
         #space_coarse = self.level_spaces[l-1]
-        space_fine: TensorProductSpace = self.level_spaces[l]
+        space_fine: TensorProductSpace = self.level_spaces[l+1]
         assert element_idx<len(self.hmesh.nodes[element_level]), "There aren't as many nodes at that level."
         #assert element_level>=l, "Not sure if l can be smaller than element_level"
 
-        coarse_element_idx = self.hmesh.get_parent_at_level(start_level=element_level, stop_level=l, marked_cells_at_start_level=element_idx)
+        coarse_element_idx = self.hmesh.get_parent_at_level(start_level=element_level, stop_level=l+1, marked_cells_at_start_level=element_idx)
         # R_local = self.refinement_operators[l-1][coarse_element_idx] #go from level l-1 to l on coarse_element_idx
         R_local = self.level_spaces[l].get_refinement_operator(index = coarse_element_idx)
 
         fine_funcs_on_elem: np.ndarray = space_fine.cell_to_basis(coarse_element_idx)
-        Bl_minus_arr = self.Bl_minus[l]
+        Bl_minus_arr = self.Bl_minus[l+1]
         # nodes_fine: list[CellNode] = self.hmesh.nodes[l]
 
-        # cols_to_truncate = np.isin(fine_funcs_on_elem, Bl_minus_arr, assume_unique=True)
-        keep_mask = (self._my_isin(fine_funcs_on_elem, Bl_minus_arr)).astype(np.float64)
-        D = sp.diags_array(keep_mask, format='csc', dtype=np.float64)
+        # keep functions that overlap coarser cells, i.e discard rows corresponding to truly active functions..
+        keep_mask = (self._my_isin(fine_funcs_on_elem, Bl_minus_arr)).astype(R_local.dtype)
+        D = sp.diags_array(keep_mask, format='csc', dtype=R_local.dtype)
         R_sliced = R_local@D
         return R_sliced
         # return R_local[:, cols_to_truncate], cols_to_truncate, R_local.shape[1]
@@ -371,6 +386,8 @@ class HierarchicalSpace():
     
     def _compute_J(self, element_idx: int, element_level: int, l: int) -> sp.csr_array:
         """
+        Keeps functions in Bl_minus.
+
         For `element` at level `element_idx` and a level `l`, the matrix J^l selects the element active functions of level l 
         that do NOT have support on Ω^l_{-} and whose support is not entirely contained in Ω^l_{+}.
 
@@ -437,7 +454,7 @@ class HierarchicalSpace():
         
         # Iteratively apply the algorithm: M_{l} = [ M_{l-1} * trunc(R) ]
         #                                          [        J^l         ]
-        for ll in range(1, l+1):
+        for ll in range(0, l):
             
             # R_sliced, mask, num_cols = self._truncation_operator(element_idx=element_idx, element_level=element_level, l=ll)
             R_sliced = self._truncation_operator(element_idx=element_idx, element_level=element_level, l=ll)
@@ -445,7 +462,7 @@ class HierarchicalSpace():
             # M_top[:, mask] = M@R_sliced
             M_top = M@R_sliced
             # Get J for current level
-            J_l = self._compute_J(element_idx=element_idx, element_level=element_level, l=ll)
+            J_l = self._compute_J(element_idx=element_idx, element_level=element_level, l=ll+1)
             M = sp.vstack((M_top, J_l), format='csr')
             
         return M
@@ -552,20 +569,6 @@ class HierarchicalSpace():
         - int:
             Greatest element in `dof_map`
 
-        Example
-        -----------------
-        Consider the space defined in D'Angella's paper, then the dofmap is: <br>
-        {(0, np.int32(0)): 0, <br>
-        (0, np.int32(1)): 1, <br>
-        (0, np.int32(2)): 2, <br>
-        (0, np.int32(3)): 3, <br>
-        (1, np.int32(6)): 4, <br>
-        (2, np.int32(12)): 5, <br>
-        (2, np.int32(13)): 6, <br>
-        (2, np.int32(14)): 7, <br>
-        (2, np.int32(15)): 8, <br>
-        (2, np.int32(16)): 9, <br>
-        (2, np.int32(17)): 10}
         """
                 
         dof_map = {}
@@ -753,7 +756,7 @@ class HierarchicalSpace():
         :return: indices of active cells marked for refinement.
         """
         
-        rectangle=np.atleast_2d(rectangle)
+        rectangle=np.atleast_2d(rectangle).astype(np.float64)
         assert rectangle.shape == (2,2), "Provided rectangle does not have an appropriate shape."
         eps = 1e-10
 
