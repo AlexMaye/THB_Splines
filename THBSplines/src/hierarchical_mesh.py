@@ -4,13 +4,86 @@ import numpy as np
 from collections import deque
 import numpy.typing as npt
 import itertools
+from math import ceil
 
+from numba import njit
+
+@njit
+def numba_get_neighbour_indices(index: int, shape: np.ndarray, p: int) -> np.ndarray:
+    dim = len(shape)
+    coords = np.empty(dim, dtype=np.int32)
+    temp = index
+
+    # equivalent to unravel_index
+    for d in range(dim - 1, -1, -1):
+        # see where index lies in current dimension
+        coords[d] = temp%shape[d]
+        #(temp1, coords[d]) = divmod(temp, shape[d])# temp % shape[d]
+        # Remove current dimension before moving on to the next one.
+        temp = temp // shape[d]
+        #temp=temp1
+        
+    allowed_offset = p# max(0, p-1)
+    side = 2*p +1
+    total_offsets = side ** dim
+    
+    neighbors = np.empty(total_offsets, dtype=np.int32)
+    count = 0
+    
+    for i in range(total_offsets):
+        temp_i = i
+        is_zero = True
+        max_offset = 0
+        num_nonzero = 0
+        out_of_bounds = False
+        n_coords = np.empty(dim, dtype=np.int32)
+        
+        for d in range(dim - 1, -1, -1):
+            #(temp_i1, val) = divmod(temp_i, side)
+
+            #unravel_index
+            val = temp_i % side
+            temp_i = temp_i // side
+            #temp_i = temp_i1
+
+            #subtract p to get offsets
+            off = val - p
+            
+            if off != 0:
+                is_zero = False
+                abs_off = abs(off)
+                if abs_off > max_offset: 
+                    max_offset = abs_off
+                if abs_off > 0: 
+                    num_nonzero += 1
+            
+            nc = coords[d] + off
+            if nc < 0 or nc >= shape[d]:
+                out_of_bounds = True
+            n_coords[d] = nc
+            
+        if is_zero or out_of_bounds:
+            continue
+            
+        if max_offset <= allowed_offset or (num_nonzero == 1 and max_offset <= p):
+            # ravel_multi_index
+            n_idx = 0
+            stride = 1
+            for d in range(dim - 1, -1, -1):
+                n_idx += n_coords[d] * stride
+                stride *= shape[d]
+            neighbors[count] = n_idx
+            count += 1
+            
+    return neighbors[:count]
+
+#@njit
 def sorted_isin(ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
         """`np.isin` when `ar2` is sorted.
         No checks are performed to ensure this.
         """
-        ar1 = np.array(ar1)
-        ar2 = np.array(ar2)
+        ar1 = np.squeeze(np.atleast_1d(ar1))
+        ar2 = np.squeeze(np.atleast_1d(ar2))
         idx = np.searchsorted(ar2, ar1)
         valid_mask = idx < len(ar2)
         vals_to_keep = np.zeros(len(ar1), dtype=bool)
@@ -96,21 +169,28 @@ class HierarchicalMesh():
 
     """
 
-    def __init__(self, knots: list[npt.NDArray]):
+    def __init__(self, knots: list[npt.NDArray], degrees: list[int]):
         dim = len(knots)
         assert dim>0
-        _, mults = np.unique(knots[0], return_counts=True)
-        self.p = mults[0]-1
+        #_, mults = np.unique(knots[0], return_counts=True)
+        self.ps = np.atleast_1d(degrees)
+        assert np.min(degrees)>=0, "Negative degrees are not allowed."
+        if len(self.ps)==1:
+            self.ps = np.full(len(knots), self.ps, dtype=np.int32) #self.degrees*np.ones(len(knots), dtype=np.intp)
+        else:
+            assert len(knots)==len(self.ps), "There are not enough degrees for the given knots."
+
         self.one_d_indices: dict[int, list[npt.NDArray]] = {0: [np.unique(knot) for knot in knots]}
         #self.meshes: list[CartesianMesh] = [CartesianMesh(knots, dim)]
-        self.meshes_shape: dict[int, list[npt.NDArray[np.int32]]] = {0: np.array([len(knot)-1 for knot in self.one_d_indices[0]], dtype=np.int32)}
+        self.meshes_shape: dict[int, npt.NDArray[np.int32]] = {0: np.array([len(knot)-1 for knot in self.one_d_indices[0]], dtype=np.int32)}
         self.nlevels: int = 1
         self.dim: int=dim
         self.nel = np.prod(self.meshes_shape[0])
         
 
-        self.nodes: dict[int, list[CellNode]] = {0: [CellNode(level=0,index=i, parent=None) for i in range(self.nel)]}
-        for node in self.nodes[0]:
+        self.nodes: dict[int, dict[int, CellNode]] = {0: {i: CellNode(level=0,index=i, parent=None) for i in range(self.nel)}
+                                                 }
+        for node in self.nodes[0].values():
             node.is_active=True
 
         self._aelem_level_set: dict[int, set[int]] = {0: set(range(self.nel))}  # active elements on level
@@ -136,16 +216,16 @@ class HierarchicalMesh():
         indices = np.atleast_1d(indices)
         refined = np.zeros_like(indices, dtype=bool)
         #considered_nodes = self.nodes[level][indices]
-        nodes_l = self.nodes[level]
+        #nodes_l = self.nodes[level]
         #refined = [node.is_refined for node in considered_nodes]
         for i, index in enumerate(indices):
-            if nodes_l[index].is_refined:
+            if self._get_node(level, index).is_refined:
                 refined[i] = True
         
         return refined
 
 
-    def refine(self, marked_cells: npt.NDArray[np.int_]|list[int], at_level: int):
+    def refine(self, marked_cells: npt.NDArray[np.int_]|list[int], at_level: int, refine_neighbours:bool=False):
         """
         Refines the hierarchical mesh, and updates the global element indices
         of active elements for each level.
@@ -166,14 +246,14 @@ class HierarchicalMesh():
         pass
         
         marked_cells = np.unique(marked_cells)
-        already_refined = self.is_refined(level=at_level, indices=marked_cells)
-        if np.all(already_refined):
-            return 
-        marked_cells = marked_cells[~already_refined]
+        # already_refined = self.is_refined(level=at_level, indices=marked_cells)
+        # if np.all(already_refined):
+        #     return 
+        # marked_cells = marked_cells[~already_refined]
         
 
         # old_active_cells = self.aelem_level
-        self._update_active_cells(marked_cells, at_level=at_level)
+        self._update_active_cells(marked_cells, at_level=at_level, refine_neighbours=refine_neighbours)
         self.nel=0
         for l in range(self.nlevels):
             self.aelem_level[l] = np.array(sorted(list(self._aelem_level_set[l])), dtype=self.aelem_level[0].dtype)
@@ -182,6 +262,58 @@ class HierarchicalMesh():
             self.nel += self.nel_per_level[l]
         pass
     pass
+
+    def _get_node(self, level: int, index: int) -> CellNode:
+        """Lazily fetches a node. If it doesn't exist, it recursively creates it and its ancestors."""
+        if level not in self.nodes:
+            self.nodes[level] = {}
+            
+        if index in self.nodes[level]:
+            return self.nodes[level][index]
+            
+        if level == 0:
+            node = CellNode(level=0, index=index, parent=None)
+            self.nodes[0][index] = node
+            return node
+            
+        # Calculate parent index analytically
+        c_shape = self.meshes_shape[level - 1]
+        f_shape = self.meshes_shape[level]
+        f_multi = np.unravel_index(index, tuple(f_shape))
+        c_multi = tuple(i // 2 for i in f_multi)
+        p_idx = int(np.ravel_multi_index(c_multi, tuple(c_shape)))
+        
+        # Recursively ensure parent exists
+        parent_node = self._get_node(level - 1, p_idx)
+        # if the parent is created, make sure that all its children are created as well
+        self._get_or_create_children(parent_node)
+        
+        return self.nodes[level][index]
+    
+    def _get_or_create_children(self, parent_node: CellNode):
+        """Safely instantiates all 2^dim children of a parent_node upon refinement."""
+        if parent_node.children:
+            #Don't do anything if the children already exist
+            return
+            
+        level = parent_node.level + 1
+        if level not in self.nodes:
+            self.nodes[level] = {}
+            
+        c_shape = self.meshes_shape[parent_node.level]
+        f_shape = self.meshes_shape[level]
+        c_multi = np.unravel_index(parent_node.index, tuple(c_shape))
+        
+        # Generate all 2^dim multi-index combinations locally
+        offsets = itertools.product(*(range(2) for _ in range(self.dim)))
+        
+        for offset in offsets:
+            f_multi = tuple(c * 2 + o for c, o in zip(c_multi, offset))
+            f_idx = int(np.ravel_multi_index(f_multi, tuple(f_shape)))
+            
+            child = CellNode(level=level, index=f_idx, parent=parent_node)
+            self.nodes[level][f_idx] = child
+            parent_node.add_child(child)
 
     def add_level(self):
         """
@@ -195,22 +327,22 @@ class HierarchicalMesh():
         coarse_shape: npt.NDArray[np.int32] = self.meshes_shape[coarse_level]
         fine_shape: npt.NDArray[np.int32] = 2*coarse_shape
         
-        num_fine_cells = np.prod(fine_shape)
+        #num_fine_cells = np.prod(fine_shape)
         self.nlevels += 1
 
-        f_flat_indices = np.arange(num_fine_cells, dtype=np.int32)
-        f_multi_indices: tuple[npt.NDArray[np.int_]] = np.unravel_index(f_flat_indices, tuple(fine_shape))
+        #f_flat_indices = np.arange(num_fine_cells, dtype=np.int32)
+        #f_multi_indices: tuple[npt.NDArray[np.int_]] = np.unravel_index(f_flat_indices, tuple(fine_shape))
 
-        c_multi_indices = tuple(idx//2 for idx in f_multi_indices)
+        #c_multi_indices = tuple(idx//2 for idx in f_multi_indices)
 
-        parent_flat_indices = np.ravel_multi_index(c_multi_indices, tuple(coarse_shape))
-        coarse_nodes = self.nodes[coarse_level]
+        #parent_flat_indices = np.ravel_multi_index(c_multi_indices, tuple(coarse_shape))
+        #coarse_nodes = self.nodes[coarse_level]
         
 
         # Initialise new attributes
         self.meshes_shape[fine_level] = fine_shape
         self.one_d_indices[fine_level] = [refine_1d(knot, n_times=1) for knot in self.one_d_indices[coarse_level]]
-        self.nodes[fine_level] = []
+        self.nodes[fine_level] = {}
         self._aelem_level_set[fine_level] = set()
         self._delem_level_set[fine_level] = set()
         self.aelem_level[fine_level] = np.array([], dtype=self.aelem_level[coarse_level].dtype)
@@ -221,16 +353,15 @@ class HierarchicalMesh():
 
         
         # Create a new node for each cell in the new level.
-        for f_idx, p_idx in zip(f_flat_indices, parent_flat_indices):
-            parent_node = coarse_nodes[p_idx]
+        # for f_idx, p_idx in zip(f_flat_indices, parent_flat_indices):
+        #     parent_node = coarse_nodes[p_idx]
 
-            child_node = CellNode(level=fine_level, index=f_idx, parent=parent_node)
-            parent_node.add_child(child_node)
-            self.nodes[fine_level].append(child_node)
+        #     child_node = CellNode(level=fine_level, index=f_idx, parent=parent_node)
+        #     parent_node.add_child(child_node)
+        #     self.nodes[fine_level].append(child_node)
 
 
-
-    def _update_active_cells(self, marked_cells: list[int]|npt.NDArray[np.int_], at_level: int):
+    def _update_active_cells(self, marked_cells: list[int]|npt.NDArray[np.int_], at_level: int, refine_neighbours=False):
         """
         Updates the set of active cells and deactivated cells.
 
@@ -239,12 +370,17 @@ class HierarchicalMesh():
         """
         # Uniquely identify all cells to be refined at a certain level
         nodes_to_refine: set[CellNode] = set()
+        if refine_neighbours:
+            disk_size = ceil((self.dim-1)/4.)
         for idx in np.atleast_1d(marked_cells):
-            nodes_to_refine.add(self.nodes[at_level][idx])
+            nodes_to_refine.add(self._get_node(at_level, idx))
+            if refine_neighbours:
+                for n_idx in self._get_neighbour_indices(at_level, index=idx, p=disk_size):
+                    nodes_to_refine.add(self._get_node(at_level, n_idx))
         pass
             
 
-        # 1. BOTTOM-UP: Identify all ancestors that need to be refined.
+        # BOTTOM-UP: Identify all ancestors that need to be refined.
         queue: deque[CellNode] = deque(nodes_to_refine)
         while queue:
             # Identify a cell that needs to be refined
@@ -259,21 +395,32 @@ class HierarchicalMesh():
 
             # Check neighbours' parents
             if node.level>0:
-                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.p)
+                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.ps[0]-1)
+                c_shape = self.meshes_shape[node.level - 1]
+                f_shape = self.meshes_shape[node.level]
                 for n_idx in neighbour_indices:
-                    neighbour_node = self.nodes[node.level][n_idx]
-                    neighbour_parent = neighbour_node.parent
+                    # neighbour_node = self.nodes[node.level][n_idx]
+                    # neighbour_parent = neighbour_node.parent
+
+                    #Avoid creating the inactive neighbour grid cell
+                    # Only the parent is created
+                    f_multi = np.unravel_index(n_idx, tuple(f_shape))
+                    c_multi = tuple(i//2 for i in f_multi)
+                    p_idx = int(np.ravel_multi_index(c_multi, tuple(c_shape)))
+
+                    neighbour_parent = self._get_node(node.level-1, p_idx)
                     
                     if (neighbour_parent and not neighbour_parent.is_refined and neighbour_parent not in nodes_to_refine):
                         nodes_to_refine.add(neighbour_parent)
                         queue.append(neighbour_parent)
                     pass
+                    
                 pass
             pass
         pass
 
 
-        # 2. TOP-DOWN: Apply refinements iteratively
+        # TOP-DOWN: Apply refinements iteratively
         sorted_nodes = sorted(list(nodes_to_refine), key=lambda x: x.level)
         for node in sorted_nodes:
             # If cell is not already refined 
@@ -288,6 +435,10 @@ class HierarchicalMesh():
                 if node.index in self._aelem_level_set[node.level]:
                     self._aelem_level_set[node.level].remove(node.index)
                 pass
+
+                # Make sure this node exists.
+                if not node.children:
+                    self._get_or_create_children(node)
                 
                 # Activate children and add indices to the set of active cells.
                 for child in node.children:
@@ -315,8 +466,8 @@ class HierarchicalMesh():
         """
         coarse_cells, indices = [], []
         for idx in np.atleast_1d(marked_cells_at_level):
-            node = self.nodes[level][idx]
-            for child in node.children:
+            node = self._get_node(level, idx) #self.nodes[level][idx]
+            for child in self._get_or_create_children(node):# node.children:
                 coarse_cells.append(idx)
                 indices.append(child.index)
             pass
@@ -337,20 +488,33 @@ class HierarchicalMesh():
         --------------------
         - indices: np.ndarray(int) parent global at level `level-1`.
         """
+        marked_cells_at_level = np.atleast_1d(marked_cells_at_level)
+        if marked_cells_at_level.size==0:
+            return np.array([], dtype=np.int32)
+        
         if not skip_assert:
             assert level>0, "Parents of cells at level 0 do not exist."
-            assert np.max(marked_cells_at_level)<len(self.nodes[level]), "There aren't as many cells at that level."
+            assert np.max(marked_cells_at_level)< np.prod(self.meshes_shape[level])#len(self.nodes[level]), "There aren't as many cells at that level."
             assert np.min(marked_cells_at_level)>=0, "Cells indices cannot be negative."
 
-        marked_cells_at_level = np.atleast_1d(marked_cells_at_level)
+        fine_shape = tuple(self.meshes_shape[level])
+        coarse_shape = tuple(self.meshes_shape[level-1])
+        child_coords = np.unravel_index(marked_cells_at_level, fine_shape)
+
+        parent_coords = tuple(c//2 for c in child_coords)
+
+        parent_indices = np.ravel_multi_index(parent_coords, coarse_shape)
+        return parent_indices
+        
         if len(marked_cells_at_level)==1:
+            return self._get_node(level, marked_cells_at_level[0]).parent.index
             return self.nodes[level][marked_cells_at_level[0]].parent.index
 
         level_nodes = self.nodes[level]
         indices = np.empty(len(marked_cells_at_level), dtype=int)
         for i, idx in enumerate(marked_cells_at_level):
-            node: CellNode = level_nodes[idx]
-            parent_node: CellNode = node.parent
+            node: CellNode = self._get_node(level, idx)# level_nodes[idx]
+            parent_node: CellNode =  node.parent
             indices[i] = parent_node.index
         pass
         return indices
@@ -365,27 +529,31 @@ class HierarchicalMesh():
         :return parent_indices: indices of parents at level `stop_level`. This method returns an int if `marked_cells_at_start_level` is
         an int or a list/array with only one index.  
         """
+        marked_cells_at_start_level = np.atleast_1d(marked_cells_at_start_level)
+        if marked_cells_at_start_level.size==0:
+            return np.array([], dtype=int)
+
         assert start_level>=0 and stop_level>=0 and stop_level<=start_level and start_level<=self.nlevels
-        assert np.max(marked_cells_at_start_level)<len(self.nodes[start_level]), "There aren't as many cells at that level."
+        assert np.max(marked_cells_at_start_level)<np.prod(self.meshes_shape[start_level])#len(self.nodes[start_level]), "There aren't as many cells at that level."
         assert np.min(marked_cells_at_start_level)>=0, "Cells indices cannot be negative."
 
         if stop_level==start_level:
             return np.squeeze(marked_cells_at_start_level)
-        if stop_level==start_level-1:
-            return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
+        # if stop_level==start_level-1:
+        #     return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         
-        marked_cells_at_start_level = np.atleast_1d(marked_cells_at_start_level)
 
-        if len(marked_cells_at_start_level)==1:
-            parent_node = self.nodes[start_level][marked_cells_at_start_level[0]].parent
-            for _ in range(1, start_level-stop_level):
-                parent_node = parent_node.parent
-            pass
-            return parent_node.index
-        pass
+        # if len(marked_cells_at_start_level)==1:
+        #     parent_node = self._get_node(start_level, marked_cells_at_start_level[0]).parent# self.nodes[start_level][marked_cells_at_start_level[0]].parent
+        #     for _ in range(1, start_level-stop_level):
+        #         parent_node = parent_node.parent
+        #     pass
+        #     return parent_node.index
+        # pass
         
         for level in range(start_level, stop_level, -1):
-            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
+            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, 
+                                                          skip_assert=True)
         return marked_cells_at_start_level
     
     def _is_point_in_cell_geometry(self, node: CellNode, point: npt.NDArray)->bool:
@@ -466,7 +634,13 @@ class HierarchicalMesh():
             pass
         pass
         
-        rect = np.atleast_2d(rect)
+        marked_cells = self.get_indices_in_rectangle(rect, level)
+        # Refine
+        self.refine(marked_cells, at_level=level)
+
+    def get_indices_in_rectangle(self, rect, level:int):
+        assert level<=self.nlevels-1
+        rect = np.atleast_2d(rect).astype(np.float64)
         if rect.shape != (self.dim, 2):
             raise ValueError(f"Rectangle must have shape ({self.dim}, 2). Got {rect.shape}")
             
@@ -498,8 +672,8 @@ class HierarchicalMesh():
             multi_indices = tuple(m.flatten() for m in mesh_indices)
             marked_cells = np.ravel_multi_index(multi_indices, shape)
             
-        # Refine
-        self.refine(marked_cells, at_level=level)
+        return marked_cells
+
 
     def _get_neighbour_indices_all_directions(self, level:int, index:int, buffer_width=1)->list[int]:
         """
@@ -534,9 +708,10 @@ class HierarchicalMesh():
         """
 
         shape = self.meshes_shape[level]
+        return numba_get_neighbour_indices(index, shape, p).tolist()
         coords = np.unravel_index(index, shape)
         neighbors = []
-        
+        allowed_offset = p# max(0,p-1)
         # Define the bounding box of potential neighbours
         # We check up to distance p in all directions, then filter.
         r = range(-p, p + 1)
@@ -553,7 +728,7 @@ class HierarchicalMesh():
             is_valid = False
             
             # Immediate neighbourhood (includes diagonals)
-            if max_offset <= 1:
+            if max_offset <= allowed_offset:
                 is_valid = True
                 
             # Cardinal extension (p cells away, but only along one axis)
