@@ -2,12 +2,33 @@ import numpy.typing as npt
 
 import numpy as np
 import scipy.sparse as sp
-from THBSplines.src.hierarchical_mesh import HierarchicalMesh, CellNode
+from THBSplines.src.hierarchical_mesh import HierarchicalMesh, sorted_isin
 from THBSplines.src.tensor_product_space import TensorProductSpace, UnivariateSplineSpace
 from copy import deepcopy
+import itertools
+from math import prod
 
-import warnings
-warnings.filterwarnings('error')
+from numba import njit
+
+@njit 
+def sorted_isin_2d(ar1_2d, ar2_1d):
+    """Vectorized isin for 2D ar1 and sorted 1D ar2."""
+    rows, cols = ar1_2d.shape
+    total_size = rows*cols
+    flat_ar1 = ar1_2d.reshape(-1)
+    idx = np.searchsorted(ar2_1d, flat_ar1)
+
+    #valid_mask = idx<len(ar2_1d)
+    my_len = len(ar2_1d)
+
+    result_flat = np.zeros(flat_ar1.shape, dtype=np.bool_)
+    for i in range(total_size):
+        if idx[i]<my_len:
+            if ar2_1d[idx[i]] == flat_ar1[i]:
+                result_flat[i] = True
+                
+    return result_flat.reshape((rows, cols))
+
 
 class HierarchicalSpace():
     """
@@ -74,7 +95,7 @@ class HierarchicalSpace():
         self.dim: int = len(knots)
         self.nlevels = 1
 
-        self.hmesh: HierarchicalMesh = HierarchicalMesh(knots=knots)
+        self.hmesh: HierarchicalMesh = HierarchicalMesh(knots=knots, degrees=degrees)
 
         univariate_spline_spaces = [UnivariateSplineSpace(degree=self.degrees[d], knots=knots[d]) for d in range(self.dim)]
         self.level_spaces: dict[int, TensorProductSpace] = {0: TensorProductSpace(dim=self.dim, univariate_spaces=univariate_spline_spaces)}
@@ -92,7 +113,7 @@ class HierarchicalSpace():
 
         l0_space = self.level_spaces[0]
         n_funcs0 = l0_space.nfuncs_total
-        self.active_cell_counts: dict[int, npt.NDArray[np.int_]] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.uint16)}
+        # self.active_cell_counts: dict[int, npt.NDArray[np.int_]] = {0: np.array([len(l0_space.basis_to_cell(i)) for i in range(n_funcs0)], dtype=np.uint16)}
 
         # self.refinement_operators: dict[int, list[sp.csc_array]] = {0: self.level_spaces[0].refinement_operators}
         # self.bezier_operators: dict[int, list[sp.bsr_array]] = {0: self.level_spaces[0].bezier_operators}
@@ -100,7 +121,7 @@ class HierarchicalSpace():
         # self.get_all_active_functions_on_cell
         
 
-    def refine(self, marked_cells: list[int], level: int, axes=None, incremental=False):
+    def refine(self, marked_cells: list[int], level: int, axes=None, incremental=False, refine_neighbours=False):
         """
         Refines the specified cells at a given level.
 
@@ -137,7 +158,7 @@ class HierarchicalSpace():
         # Update the physical mesh topology
         # This includes refining the current finest mesh, creating new CellNodes if necessary, 
         # and updating active/deactivated cells
-        self.hmesh.refine(marked_cells=marked_cells, at_level=level)
+        self.hmesh.refine(marked_cells=marked_cells, at_level=level, refine_neighbours=refine_neighbours)
         
         if incremental:
             # Make sure that we are not refining an already refined cell.
@@ -193,31 +214,96 @@ class HierarchicalSpace():
         self.deactivated_functions: dict[int, npt.NDArray[np.int32]] = {}
         self.Bl_minus: dict[int, npt.NDArray[np.int32]] = {}
         self.truly_active: dict[int, npt.NDArray[np.int32]] = {}
+
+        dim = self.hmesh.dim
         
         for l in range(self.nlevels):
             space_l: TensorProductSpace = self.level_spaces[l]
             nfuncs = space_l.nfuncs_total
             # Quick lookup dictionary for level l cells
-            nodes_l: list[CellNode] = self.hmesh.nodes[l]
+            #nodes_l: dict[int, CellNode] = self.hmesh.nodes[l]
             
             is_active_mask: npt.NDArray[np.bool_] = np.zeros(nfuncs, dtype=bool)
             is_minus_mask: npt.NDArray[np.bool_] = np.zeros_like(is_active_mask)
+            #active_cells = []
+            active_cells_arr = self.hmesh.aelem_level[l]
+            #parent_active_cells_arr = np.array([cell_idx for cell_idx, node in nodes_l.items() if (node.parent and node.parent.is_active)],
+            #                                   dtype=np.int32)
+            if l>0:
+                active_cells_up = self.hmesh.aelem_level[l-1]
 
-            for cell_idx, node in enumerate(nodes_l):
-                # This loop is relatively fast because many cells are skipped, as many are inactive.
-                cell_active: bool = node.is_active
-                parent_active: bool = node.parent.is_active if node.parent else False
+                if active_cells_up.size==0:
+                    parent_active_cells_arr = np.array([], dtype=np.int32)
 
-                if cell_active or parent_active:
-                    affected_funcs: npt.NDArray[np.int_] = space_l.cell_to_basis(cell_idx)
-                    if cell_active:
-                        is_active_mask[affected_funcs]=True
-                    if parent_active:
-                        is_minus_mask[affected_funcs]=True
+                else:
+                    
+                    shape_up = self.hmesh.meshes_shape[l-1]
+                    shape_l = self.hmesh.meshes_shape[l]
+
+                    # Unravel 1D parent indices to N-D coordinates: shape is (d, N)
+                    p_multi = np.unravel_index(active_cells_up, shape_up)
+
+                    # Base child coordinates (multiply by 2): stack and transpose to (N, d)
+                    # in 2d, this corresponds to the bottom left corner of the child cells
+                    # stack(axis=-1) for 1d arrays means that each 1d array becomes a column in the
+                    # newly formed array
+                    base_coords = np.stack(p_multi, axis=-1)*2
+
+                    # Generate the 2^d binary offsets: shape (2^d, d)
+                    # since we have the bottom left corner, we need to generate the top cell (+(0,1)),
+                    # the cell to the right (+(1,0)) and the cell to the upper right (+(1,1))
+                    # the cell itself is generated as well (+(0,0))
+                    offsets = np.array(list(itertools.product([0, 1], repeat=dim)), dtype=base_coords.dtype)
+
+                    # Add offsets using broadcasting: (N, 1, d) + (1, 2^d, d) -> (N, 2^d, d)
+                    # this creates a 3d numpy array, where each entry is a (2^d, d) matrix
+                    # corresponding to the children coordinates of each active cell of level l-1
+                    # each row of this matrix are the coordinates of the child cells
+                    child_coords = base_coords[:, None, :] + offsets[None, :, :]
+
+                    # Reshape to a flat list of N-D coordinates: (N * 2^d, d)
+                    child_coords_flat = child_coords.reshape(-1, dim)
+                    # Separate the indices into a tuple of two arrays. 
+                    child_coords_tuple = tuple(child_coords_flat[:, d] for d in range(dim))
+
+                    # Ravel back to 1D indices using the shape of level l
+                    # np.ravel_multi_index expects a tuple of 1D arrays (one per dimension)
+                    parent_active_cells_arr = np.ravel_multi_index(child_coords_tuple, shape_l)
+                    
+                    # Ensure strict lexicographical sorting 
+                    # parent_active_cells_arr = np.sort(parent_active_cells_arr)
+            else:
+                parent_active_cells_arr = np.array([], dtype=np.int32)
+            # for cell_idx, node in nodes_l.items():
+            #     # This loop is relatively fast because many cells are skipped, as many are inactive.
+            #     cell_active: bool = node.is_active
+            #     parent_active: bool = node.parent.is_active if node.parent else False
+
+            #     if cell_active or parent_active:
+            #         #affected_funcs: npt.NDArray[np.int_] = space_l.cell_to_basis(cell_idx)
+            #         if cell_active:
+            #             #is_active_mask[affected_funcs]=True
+            #             #active_cells.append(cell_idx)
+            #             pass
+            #         if parent_active:
+            #             #is_minus_mask[affected_funcs]=True
+            #             parent_active_cells.append(cell_idx)
                         
-                    pass
-                pass
-            pass
+            #         pass
+            #     pass
+            # pass
+
+            # parent_active_cells_arr = np.array(parent_active_cells, dtype=np.int32)
+
+            if active_cells_arr.size > 0:
+                # Returns shape (N, functions_per_cell). .ravel() flattens it to 1D
+                affected_active = space_l.cell_to_basis(active_cells_arr).ravel()
+                is_active_mask[affected_active] = True
+                
+            
+            if parent_active_cells_arr.size > 0:
+                affected_minus = space_l.cell_to_basis(parent_active_cells_arr).ravel()
+                is_minus_mask[affected_minus] = True
             
             all_indices = np.arange(nfuncs, dtype=np.int32)
             self.active_functions[l] = all_indices[is_active_mask]
@@ -233,7 +319,7 @@ class HierarchicalSpace():
         :param marked_cells: indices of cells that were refined
         :param level: level of `marked_cells`
         """
-
+        return
         space_l = self.level_spaces[level]
         # all affected functions
 
@@ -321,22 +407,6 @@ class HierarchicalSpace():
         pass
     pass
 
-    def _my_isin(self, ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
-        """`np.isin` when `ar2` is sorted.
-        No checks are performed to ensure this.
-        """
-        ar1 = np.atleast_1d(ar1)
-        ar2 = np.atleast_1d(ar2)
-        return np.isin(ar1, ar2, assume_unique=False)
-        if len(ar2)<2:
-            # searchsorted fails for short arrays
-            return np.isin(ar1, ar2)
-        idx = np.searchsorted(ar2, ar1)
-        valid_mask = idx < len(ar2)
-        cols_to_keep = np.zeros(len(ar1), dtype=bool)
-        cols_to_keep[valid_mask] = ar2[idx[valid_mask]]==ar1[valid_mask]
-        return cols_to_keep
-
     def _truncation_operator(self, element_idx: int, element_level: int, l: int)->sp.csc_array:
         """
         it represents with functions of level l
@@ -365,19 +435,23 @@ class HierarchicalSpace():
         assert l>=0, "l has to be positive, as the returned truncation matrix goes from level `l-1` to `l`."
         #space_coarse = self.level_spaces[l-1]
         space_fine: TensorProductSpace = self.level_spaces[l+1]
-        assert element_idx<len(self.hmesh.nodes[element_level]), "There aren't as many nodes at that level."
+        assert element_idx<prod(self.level_spaces[element_level].mesh_shape), "There aren't as many nodes at that level."
         #assert element_level>=l, "Not sure if l can be smaller than element_level"
 
         coarse_element_idx = self.hmesh.get_parent_at_level(start_level=element_level, stop_level=l+1, marked_cells_at_start_level=element_idx)
         # R_local = self.refinement_operators[l-1][coarse_element_idx] #go from level l-1 to l on coarse_element_idx
-        R_local = self.level_spaces[l].get_refinement_operator(index = coarse_element_idx)
+        try:
+            R_local = self.level_spaces[l].get_refinement_operator(index = coarse_element_idx)
+        except TypeError:
+            self.level_spaces[l].get_refinement_operator(index = coarse_element_idx)
+            pass
 
         fine_funcs_on_elem: np.ndarray = space_fine.cell_to_basis(coarse_element_idx)
         Bl_minus_arr = self.Bl_minus[l+1]
         # nodes_fine: list[CellNode] = self.hmesh.nodes[l]
 
         # keep functions that overlap coarser cells, i.e discard rows corresponding to truly active functions..
-        keep_mask = (self._my_isin(fine_funcs_on_elem, Bl_minus_arr)).astype(R_local.dtype)
+        keep_mask = (sorted_isin(fine_funcs_on_elem, Bl_minus_arr)).astype(R_local.dtype)
         D = sp.diags_array(keep_mask, format='csc', dtype=R_local.dtype)
         R_sliced = R_local@D
         return R_sliced
@@ -403,7 +477,7 @@ class HierarchicalSpace():
         """
         assert (l>=0) and (element_level>=0), "Requested level does not exist."
         assert (element_level<=self.nlevels-1) and (l<=self.nlevels-1), "Requested level does not exist."
-        assert element_idx<len(self.hmesh.nodes[element_level]), "Requested element does not exist."
+        assert element_idx< prod(self.level_spaces[element_level].mesh_shape), "Requested element does not exist." #len(self.hmesh.nodes[element_level])
         # element_space = self.level_spaces[element_level]
         space_l: TensorProductSpace = self.level_spaces[l]
 
@@ -416,7 +490,7 @@ class HierarchicalSpace():
         active_thb_funcs_l: np.ndarray = self.active_functions[l] #discards functions only active on Ω^l_{+} and Ω^l_{-}
 
         # Get active functions on relevant element
-        active_funcs_on_elem = self._my_isin(ar1=funcs_on_elem, ar2=active_thb_funcs_l)
+        active_funcs_on_elem = sorted_isin(ar1=funcs_on_elem, ar2=active_thb_funcs_l)
 
         if not np.any(active_funcs_on_elem):
             return sp.csr_array((0, my_size), dtype=np.float64)
@@ -424,7 +498,7 @@ class HierarchicalSpace():
         
         # keep functions that are active and are not supported on the coarser mesh
         # for l=0, Bl_minus[0] is empty, therefore the second argument evaluates to all True
-        rows_to_keep = active_funcs_on_elem & (~self._my_isin(funcs_on_elem, self.Bl_minus[l]))# (~np.isin(funcs_on_elem, self.Bl_minus[l], assume_unique=True))
+        rows_to_keep = active_funcs_on_elem & (~sorted_isin(funcs_on_elem, self.Bl_minus[l]))# (~np.isin(funcs_on_elem, self.Bl_minus[l], assume_unique=True))
 
         indices = np.flatnonzero(rows_to_keep)
         num_rows = len(indices)
@@ -466,7 +540,103 @@ class HierarchicalSpace():
             M = sp.vstack((M_top, J_l), format='csr')
             
         return M
+    
+    def local_multi_level_extraction_operator2(self, element_indices: list[int], element_level, l)->list[sp.csr_array]:
+        element_indices = np.atleast_1d(element_indices)
+        if element_indices.size==0:
+            return
+        assert (element_level>=0)
+        assert (element_level<=self.nlevels-1)
+        assert np.max(element_indices)<prod(self.level_spaces[element_level].mesh_shape)
 
+        def compute_J(element_indices, active_funcs_level, l):
+            #space_l = self.level_spaces[l]
+            #coarse_ancestor_indices = self.hmesh.get_parent_at_level(start_level=element_level,
+            #                                                         stop_level=l,
+            #                                                         marked_cells_at_start_level=element_indices)
+            #funcs_on_elems = space_l.cell_to_basis(coarse_ancestor_indices)
+            #funcs_on_elems = active_funcs_level
+            #my_size = np.atleast_2d(funcs_on_elems).shape[1]
+            active_thb_funcs_l = self.truly_active[l]
+            active_funcs_level=np.atleast_2d(active_funcs_level)
+            active_funcs_on_elem = sorted_isin_2d(ar1_2d=active_funcs_level, ar2_1d=active_thb_funcs_l)
+            num_elems, num_cols = np.atleast_2d(active_funcs_on_elem).shape
+            Js = []
+            for i in range(num_elems):
+                
+                rows_to_keep = active_funcs_on_elem[i]
+                indices = np.flatnonzero(rows_to_keep)
+                num_rows = len(indices)
+                if num_rows==0:
+                    #Js.append(sp.csr_array((0, num_cols), dtype=np.float64))
+                    Js.append(np.zeros((0, num_cols), dtype=np.float64))
+                else:
+                    #num_cols = len(rows_to_keep)
+                    #data = np.ones(num_rows, dtype=np.float64)
+                    #row_indices = np.arange(num_rows)
+                    #row_ptr = np.arange(num_rows+1, dtype=np.int32)
+                    # col_indices = indices
+                    #Js.append(sp.csr_array((data, (row_indices, col_indices)), shape=(num_rows, num_cols), dtype=np.float64))
+                    #Js.append(sp.csr_array((data, indices, row_ptr), shape=(num_rows, num_cols)))
+
+                    J_dense = np.zeros((num_rows, num_cols), dtype=np.float64)
+                    J_dense[np.arange(num_rows), indices] = 1.
+                    Js.append(J_dense)
+            return Js
+
+        def truncation_operator(cells_at_level, active_funcs_at_level, l):
+            #space_fine = self.level_spaces[l+1]
+            #coarse_element_indices = self.hmesh.get_parent_at_level(start_level=elements_level, stop_level=l+1, 
+            #                                                        marked_cells_at_start_level=element_indices)
+            coarse_element_indices = cells_at_level
+            Rs_local: list = self.level_spaces[l].get_refinement_operators(indices=coarse_element_indices)
+            
+            fine_funcs_on_elems = np.atleast_2d(active_funcs_at_level)# space_fine.cell_to_basis(coarse_element_indices)
+            Bl_minus_arr: npt.NDArray[np.int_] = self.Bl_minus[l+1]
+            keep_masks:npt.NDArray = sorted_isin_2d(ar1_2d=fine_funcs_on_elems, ar2_1d=Bl_minus_arr).astype(np.bool_)
+            #Rs_sliced = [R_local@sp.diags_array(keep_mask, format='csc', dtype=dtype) 
+            #             for R_local, keep_mask in zip(Rs_local, keep_masks)]
+            Rs_sliced = []
+            for R_local, keep_mask in zip(Rs_local, keep_masks):
+                R_local[:, ~keep_mask] = 0.
+                Rs_sliced.append(R_local)
+            #Rs_sliced = [R_local[:, keep_mask] for R_local, keep_mask in zip(Rs_local, keep_masks)]
+            
+            return Rs_sliced
+        
+        dtype = self.level_spaces[0].spaces[0].Rs[0].dtype
+        # get parents of cells at coarsest level
+        # If n cells have the same parent, the index of the parent is returned n times.
+        cells_level: npt.NDArray[np.int_] = self.hmesh.get_parent_at_level(start_level=element_level, 
+                                                                           stop_level=0, 
+                                                                           marked_cells_at_start_level=element_indices)
+        
+        # and the functions of level 0 that have support on these cells
+        active_funcs_level: npt.NDArray[np.int_] = self.level_spaces[0].cell_to_basis(cells_level)
+
+        # Discard rows corresponding to functions that have support on a coarser level (passive functions)
+        # or are fully contained in a finer level (inactive functions)
+        
+        Ms: list = compute_J(element_indices=element_indices, active_funcs_level=active_funcs_level, l=0)
+        #parents_level_ll = element_indices
+
+        for ll in range(0,l):
+            cells_level = self.hmesh.get_parent_at_level(start_level=element_level, 
+                                                         stop_level=ll+1, 
+                                                         marked_cells_at_start_level=element_indices)
+            
+            active_funcs_level = self.level_spaces[ll+1].cell_to_basis(cells_level)
+            
+            Rs_sliced: list = truncation_operator(cells_at_level=cells_level, active_funcs_at_level=active_funcs_level, l=ll)
+            M_tops:list = [M@R_sliced for M, R_sliced in zip(Ms, Rs_sliced)]
+            
+            Jls: list = compute_J(element_indices=element_indices, active_funcs_level=active_funcs_level, l=ll+1)
+            #Ms: list = [sp.vstack((M_top, Jl), format='csr') for M_top, Jl in zip(M_tops, Jls)]
+            Ms: list = [np.vstack((M_top, Jl)) for M_top, Jl in zip(M_tops, Jls)]
+
+        return Ms
+
+            
     
     def _deduplicate_dofs(self, dofs:list[tuple])->list[tuple]:
         """Helper method to remove duplicates while strictly preserving insertion order."""
@@ -495,7 +665,7 @@ class HierarchicalSpace():
 
             # Find which level 'l' functions are inactive.
             # This is not the same as deactivated functions.
-            active_mask: npt.NDArray[np.bool_] = self._my_isin(funcs_l, self.truly_active[l])
+            active_mask: npt.NDArray[np.bool_] = sorted_isin(funcs_l, self.truly_active[l])
             inactive_funcs: npt.NDArray[np.int32] = np.array(funcs_l)[~active_mask]
 
             # Batch fetch children for the inactive functions
@@ -539,7 +709,7 @@ class HierarchicalSpace():
         # Final filtering to remove any max_level functions that are not truly active
         max_level_funcs: list[np.int32] = [f for (lvl, f) in current_dofs if lvl == max_level]
         if max_level_funcs:
-            active_max_mask: npt.NDArray[np.bool_] = self._my_isin(max_level_funcs, self.truly_active[max_level])
+            active_max_mask: npt.NDArray[np.bool_] = sorted_isin(max_level_funcs, self.truly_active[max_level])
             active_max_set = set(np.array(max_level_funcs)[active_max_mask])
         else:
             active_max_set = set()
@@ -615,7 +785,7 @@ class HierarchicalSpace():
         """
         # - dict[int, np.ndarray]: all functions that have support on this cell, whether they are active or not.
 
-        assert self.hmesh.nodes[level][cell_idx].is_active, "Provided cell is inactive."
+        assert self.hmesh._get_node(level, cell_idx).is_active, "Provided cell is inactive."
         # functions = self.level_spaces[level].cell_to_basis(cell_idx)
         # functions_on_cell: np.ndarray = np.intersect1d(functions, self.active_functions[level], assume_unique=True)
         active_functions_l = {}
@@ -632,7 +802,7 @@ class HierarchicalSpace():
 
             if len(functions_on_cell)>0 and len(truly_active)>0:
                 # Given the functions that have support on this cell, which ones are active?
-                active_mask: npt.NDArray[np.bool_] = self._my_isin(functions_on_cell, truly_active)
+                active_mask: npt.NDArray[np.bool_] = sorted_isin(functions_on_cell, truly_active)
                 active_functions_l[l] = functions_on_cell[active_mask]
 
             else:
@@ -746,7 +916,7 @@ class HierarchicalSpace():
 
         return M
 
-    def refine_in_rectangle(self, rectangle: npt.NDArray, level: int):
+    def refine_in_rectangle(self, rectangle: npt.NDArray, level: int, refine_neighbours=False):
         """
         Refines the mesh from `level` to `level`+1. All cells that intersect with the rectangle are refined up to a suitable level.
         This is to avoid L-shaped domains.
@@ -758,7 +928,7 @@ class HierarchicalSpace():
         
         rectangle=np.atleast_2d(rectangle).astype(np.float64)
         assert rectangle.shape == (2,2), "Provided rectangle does not have an appropriate shape."
-        eps = 1e-10
+        eps = 1e-13
 
         def find_intersecting_geometrically(level: int)->npt.NDArray[np.int_]:
                 # multi_index = np.unravel_index(cell_indices, tuple(self.hmesh.meshes_shape[level]))
@@ -787,7 +957,7 @@ class HierarchicalSpace():
         active_indices = find_intersecting_geometrically(0)
         if active_indices is None:
             return
-        self.refine(marked_cells=active_indices, level=0)
+        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours)
 
         for l in range(1, level+1):
                 # _, children_cells = self.hmesh.get_children(level=l-1, marked_cells_at_level=active_indices)
@@ -795,8 +965,73 @@ class HierarchicalSpace():
                 active_indices = find_intersecting_geometrically(l)
                 if active_indices is None:
                     return
-                self.refine(marked_cells=active_indices, level=l)
+                self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours)
 
+    def refine_in_rectangles(self, rectangles, level, refine_neighbours=False):
+        """
+        Refines the mesh from `level` to `level`+1. All cells that intersect with 
+        ANY of the provided rectangles are refined up to a suitable level.
+
+        :param rectangles: array of shape (N, dim, 2) containing endpoints of N rectangles.
+                           Also accepts a single rectangle of shape (dim, 2).
+        :param level: refinement level
+        :return: indices of active cells marked for refinement.
+        """
+        rectangles = np.asarray(rectangles, dtype=np.float64)
+        if rectangles.ndim==2:
+            rectangles = rectangles[None, :, :]
+        pass
+
+        assert rectangles.ndim==3 and rectangles.shape[1]==self.dim and rectangles.shape[2] == 2, \
+            f"Provided rectangles must have shape (N, {self.dim}, 2)."
+        
+        eps = 1e-13
+        N = rectangles.shape[0]
+
+        def find_intersecting_geometrically(level: int) -> npt.NDArray[np.int_]:
+            # Initialize an (N, 1, 1, ...) boolean mask that we will expand via broadcasting
+            combined_mask = np.ones([N] + [1] * self.dim, dtype=bool)
+            
+            for d in range(self.dim):
+                knots_l_d = self.hmesh.one_d_indices[level][d]
+                c_mins, c_maxs = knots_l_d[:-1], knots_l_d[1:]
+                
+                rect_mins = rectangles[:, d, 0]  # Shape: (N,)
+                rect_maxs = rectangles[:, d, 1]  # Shape: (N,)
+                
+                # 1D Intersection mask. Shape: (N, num_cells_in_d)
+                mask_1d = (c_maxs[None, :]>=rect_mins[:, None]+eps) & (c_mins[None, :]<=rect_maxs[:, None]-eps)
+                
+                # Dynamically set the reshape tuple to broadcast the current dimension
+                # e.g., for dim=2 and d=0 -> (N, num_cells_x, 1)
+                # e.g., for dim=2 and d=1 -> (N, 1, num_cells_y)
+                broadcast_shape = [N] + [1] * self.dim
+                broadcast_shape[d + 1] = len(c_mins)
+                
+                # Accumulate the ND mask via bitwise AND
+                combined_mask = combined_mask & mask_1d.reshape(broadcast_shape)
+            
+            # Collapse the N axis (True if a cell intersects ANY of the rectangles)
+            any_intersect = combined_mask.any(axis=0)
+            
+            if not any_intersect.any():
+                print(f"No cells intersect the provided rectangles at level {level}.")
+                return None
+                
+            return np.flatnonzero(any_intersect)
+            
+        # Refinement Execution
+        active_indices = find_intersecting_geometrically(0)
+        if active_indices is None:
+            return
+            
+        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours)
+
+        for l in range(1, level + 1):
+            active_indices = find_intersecting_geometrically(l)
+            if active_indices is None:
+                return
+            self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours)
         
 
     def plot_overloading(self, filename=None, text=False, fontsize=None):
@@ -828,7 +1063,7 @@ class HierarchicalSpace():
                     fill = False
                     dotext = False
 
-                e = hmesh.cells[cell]
+                e = self.hmesh.cells[cell]
                 w = e[0, 1] - e[0, 0]
                 h = e[1, 1] - e[1, 0]
                 mp1 = e[0, 0] + w / 2
