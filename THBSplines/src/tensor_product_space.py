@@ -148,6 +148,13 @@ def _knot_insertion_impl(p: int, coarsekn: np.ndarray, finekn: np.ndarray)->np.n
 
     return R, e
 
+@jit(nopython=True)
+def numba_cell_to_basis_indices(cell_indices:npt.NDArray[np.int_], cell_to_last_knot:npt.NDArray[np.int_], degree:int)->npt.NDArray[np.int_]:
+    j = cell_to_last_knot[cell_indices]
+    offsets = np.arange(-degree, 1, dtype=j.dtype)
+    return j[:, None]+offsets[None, :]
+    
+
 class UnivariateSplineSpace():
     """
 
@@ -224,7 +231,6 @@ class UnivariateSplineSpace():
         Given the indices of BSplines in the current space, returns a list of indices of children BSplines
         in the dyadic refinement of the current space.
 
-
     """
 
     def __init__(self, degree: int, knots: npt.ArrayLike):
@@ -241,6 +247,8 @@ class UnivariateSplineSpace():
             self.knots = np.append(self.knots, self.knots[-1]*np.ones(p1-mults[-1], dtype=self.knots.dtype))
         elif mults[-1]>self.degree+1:
             self.knots = np.delete(self.knots, np.arange(len(self.knots)-1, len(self.knots)-mults[-1]+p1-1, -1))
+
+        self.no_internal_multiplicity = np.all(mults[1:-1]==1)
 
         self.nfuncs: int = len(self.knots)-p1
         self.unique_knots, self.knot_to_unique = np.unique(self.knots, return_inverse=True)
@@ -269,23 +277,26 @@ class UnivariateSplineSpace():
         self.Rs, _ = self.element_knot_insertion_operator()
         self.bezier = self.bezier_extraction_operator()
 
-    def cell_to_basis_indices(self, cell_indices: int | npt.NDArray[np.int_] | list[int]) -> npt.NDArray[np.int_]:
+    def cell_to_basis_indices(self, cell_indices: int | npt.NDArray[np.int_] | list[int],
+                              skip_assert=False) -> npt.NDArray[np.int_]:
         """
         Takes a single cell index or an array of N cell indices.
         Returns an array of shape (N, p+1) containing the basis indices.
         """
         cell_indices = np.atleast_1d(cell_indices)
-        assert np.max(cell_indices)<self.n_cells, 'The space does not have as many cells.'
+        if not skip_assert:
+            assert np.max(cell_indices)<self.n_cells, 'The space does not have as many cells.'
         # j has shape (N,)
-        j = self.cell_to_last_knot[cell_indices]
+        #j = self.cell_to_last_knot[cell_indices]
         
         # offsets has shape (p+1,) -> [-p, -p+1, ..., 0]
-        offsets = np.arange(-self.degree, 1, dtype=j.dtype)
+        #offsets = np.arange(-self.degree, 1, dtype=j.dtype)
         
         # Broadcasting: (N, 1) + (1, p+1) -> shape (N, p+1)
-        basis_idx = j[:, None] + offsets[None, :]
+        #basis_idx = j[:, None] + offsets[None, :]
         
-        return basis_idx
+        #return basis_idx
+        return numba_cell_to_basis_indices(cell_indices=cell_indices, cell_to_last_knot=self.cell_to_last_knot, degree=self.degree)
     
     def basis_to_cell_indices(self, basis_indices: int|npt.NDArray[np.int_]|list[int])->list[npt.NDArray[np.int32]]:
         """
@@ -573,10 +584,59 @@ class TensorProductSpace():
         # self.mesh = CartesianMesh([space.knots for space in self.spaces], self.dim)
         self.mesh_shape: tuple[int] = tuple([space.n_cells for space in self.spaces])
         self.next_mesh_shape: tuple[int] = tuple([space.Rs.shape[0] for space in self.spaces])
-        self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
-        self.basis_indices_supports = self._cell_to_basis(np.arange(np.prod(self.mesh_shape), dtype=np.int32))
+        # self.cell_supports = np.array(self._basis_to_cell(np.arange(self.nfuncs_total, dtype=np.int32)), dtype=object)
+        # self.basis_indices_supports = self._cell_to_basis(np.arange(np.prod(self.mesh_shape), dtype=np.int32))
         
         # self._set_bezier_and_refinements(mode=mode)
+
+        #self.no_internal_multiplicity = all([space.no_internal_multiplicity for space in self.spaces])
+        #if self.no_internal_multiplicity:
+        #    self.boundary_cells, self.interior_cells = self.get_cell_classification()
+        
+        #    interior00 = np.unravel_index(self.interior_cells[0], shape=self.next_mesh_shape)
+            #interior10 = np.array(interior00)+np.array([1,0])
+            #interior01 = np.array(interior00)+np.array([0,1])
+            #interior11 = np.array(interior00)+np.array([1,1])
+
+            #matrices00 = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, interior00)]
+            #self.interior_refinement_kron = reduce(lambda x,y: sp.csc_array(sp.kron(x,y, format='csc')), matrices)
+            #self.interior_refinement_kron00 = reduce(lambda x,y: np.kron(x,y), matrices00)
+            #self.interior_refinement_kron00 = self._form_kron_matrices(interior00, np.array([0,0]))
+            #self.interior_refinement_kron01 = self._form_kron_matrices(interior00, np.array([0,1]))
+            #self.interior_refinement_kron10 = self._form_kron_matrices(interior00, np.array([1,0]))
+            #self.interior_refinement_kron11 = self._form_kron_matrices(interior00, np.array([1,1]))
+
+
+    def _form_kron_matrices(self, base_index, offset):
+        new_interior = np.array(base_index) + offset
+        if not np.all(np.isin(np.ravel_multi_index(new_interior, self.next_mesh_shape), self.interior_cells)):
+            return None
+        matrices = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.space, new_interior)]
+        return reduce(lambda x, y: np.kron(x,y), matrices)
+
+    def get_cell_classification(self):
+        # nD matrix with shape of the mesh. 
+        # if the mesh is 100x150, this is a 100x150 matrix of zeros
+        is_boundary = np.zeros(self.next_mesh_shape, dtype=bool)
+
+        for axis in range(self.dim):
+            p = self.degrees[axis]
+            lower_thickness = p
+            upper_thickness = p
+            slice_lower = [slice(None)] * self.dim
+            slice_lower[axis] = slice(0, lower_thickness)
+            is_boundary[tuple(slice_lower)]=True
+
+            slice_upper = [slice(None)] * self.dim
+            slice_upper[axis] = slice(self.next_mesh_shape[axis] - upper_thickness, None)
+            is_boundary[tuple(slice_upper)] = True
+
+        boundary_cells = np.flatnonzero(is_boundary)
+        interior_cells = np.flatnonzero(~is_boundary)
+
+        return boundary_cells, interior_cells
+    
+    
 
     def _set_bezier_and_refinements(self, mode: str="sparse"):
         """Initialises the attributes `self.refinement_operators` and `self.bezier_operators`, either with dense
@@ -634,7 +694,7 @@ class TensorProductSpace():
                     self.refinement_operators = np.asfortranarray(refinement_operators)
 
                 
-    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray:
+    def _basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray:
         """
         Returns the indices of cells in the support of the passed basis
         indices. The 'inverse' of cell_to_basis.
@@ -644,7 +704,7 @@ class TensorProductSpace():
         """
         return self.cell_supports[basis_indices]
 
-    def _basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_]) -> npt.NDArray[np.int_]:
+    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_]) -> npt.NDArray[np.int_]:
         """
         Returns the indices of cells in the support of the passed basis
         indices. The 'inverse' of cell_to_basis.
@@ -677,7 +737,7 @@ class TensorProductSpace():
             
         return nd_cells_list
     
-    def cell_to_basis(self, cell_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray[np.int_]:
+    def _cell_to_basis(self, cell_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray[np.int_]:
         """Returns the indices of the function supported in the given list of cells.
         A basis function is returned if its support contains a cell in `cell_indices`.
         The "inverse" of basis_to_cell.
@@ -686,7 +746,7 @@ class TensorProductSpace():
         """
         return self.basis_indices_supports[cell_indices]
 
-    def _cell_to_basis(self, cell_list: np.ndarray) -> np.ndarray:
+    def cell_to_basis(self, cell_list: int|npt.NDArray[np.int_]) -> npt.NDArray[np.int_]:
         """
         Returns the indices of basis functions supported over the given list of cells.
         A basis function is returned if its support contains a cell in `cell_list`.
@@ -707,7 +767,7 @@ class TensorProductSpace():
         # Get 1D basis functions for each dimension
         expanded_basis_1d = []
         for d in range(self.dim):
-            b_1d = self.spaces[d].cell_to_basis_indices(tensor_idx[d])
+            b_1d = self.spaces[d].cell_to_basis_indices(tensor_idx[d], skip_assert=True)
             # if cell_list has elements [a,b,...,n] and p=2, this looks like array([[a_1,a_2,a_3], [b_1, b_2, b_3],...])
             target_shape = [len(cell_list)] + [1] * self.dim
             # = [len(cell_list), self.dim, self.dim]
@@ -727,7 +787,7 @@ class TensorProductSpace():
             mode='raise',
             order='C' #last dimension varies the fastest
         )
-        return flat_basis_nd.reshape(len(cell_list), -1).astype(np.int32)
+        return np.squeeze(flat_basis_nd.reshape(len(cell_list), -1).astype(np.int32))
         # Flatten the array and return unique basis indices
         #return np.unique(flat_basis_nd)
 
@@ -775,12 +835,45 @@ class TensorProductSpace():
         """
         indices = np.unravel_index(index, shape=self.next_mesh_shape)
         
-        matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
+        matrices = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, indices)]
         if not matrices:
             return None
         # Nothing happens if the list only has one element: a numpy array is kept.
-        kron_product = reduce(lambda x, y: sp.kron(x,y,format='csc'), matrices)
-        return sp.csc_array(kron_product)
+        #kron_product = reduce(lambda x, y: sp.kron(x,y,format='csc'), matrices)
+        #return sp.csc_array(kron_product)
+        return reduce(lambda x,y: np.kron(x,y), matrices)
+    
+    def get_refinement_operators(self, indices:list[int])->list[sp.csc_array]:
+        indices = np.unravel_index(indices, shape=self.next_mesh_shape)
+        matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
+        if not matrices:
+            return None
+        # Transpose the list of matrices
+        matrices = [list(i) for i in zip(*matrices)]
+        #kron_product = [sp.csc_array(reduce(lambda x,y: sp.kron(np.squeeze(x), np.squeeze(y), format='csc'),
+        #                       matrix)) for matrix in matrices]
+        #return kron_product
+        return [reduce(lambda x,y: np.kron(np.squeeze(x),np.squeeze(y)), matrix) for matrix in matrices]
+    
+    # def get_refinement_operators_optimised(self, indices:list[int])->list[sp.csc_array]:
+    #     """This does not work yet"""
+        
+    #     indices = np.array(indices)
+    #     if self.no_internal_multiplicity:
+    #         _,  interior_cells = self.get_cell_classification()
+    #         can_skip_computation = np.isin(indices, interior_cells)
+    #     else:
+    #         can_skip_computation = np.zeros_like(indices, dtype=bool)
+    #     kron_products = []
+    #     # for idx1, index in enumerate(indices):
+    #     #     if not can_skip_computation[idx1]:
+    #     #         kron_products.append(self.get_refinement_operator(index))
+    #     #     else:
+    #     #         kron_products.append(self.interior_refinement_kron)
+    #     kron_products = [self.get_refinement_operator(index) if not can_skip_computation[idx] 
+    #                      else self.interior_refinement_kron for idx, index in enumerate(indices)]
+        
+    #     return kron_products
 
     def get_bezier_operator(self, index: int):
         indices = np.unravel_index(index, shape=self.mesh_shape)
@@ -788,8 +881,9 @@ class TensorProductSpace():
         matrices = [space.bezier[idx] for space, idx in zip(self.spaces, indices)]
         if not matrices:
             return None
-        kron_product = reduce(lambda x, y: sp.kron(x,y,format='bsr'), matrices)
-        return sp.bsr_array(kron_product, blocksize = (self.degrees[-1]+1, self.degrees[-1]+1))
+        #kron_product = reduce(lambda x, y: sp.kron(x,y,format='bsr'), matrices)
+        #return sp.bsr_array(kron_product, blocksize = (self.degrees[-1]+1, self.degrees[-1]+1))
+        return reduce(lambda x,y: np.kron(x,y), matrices)
         
 
 
