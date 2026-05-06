@@ -82,7 +82,7 @@ def sorted_isin(ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
         """`np.isin` when `ar2` is sorted.
         No checks are performed to ensure this.
         """
-        ar1 = np.squeeze(np.atleast_1d(ar1))
+        ar1 = np.atleast_1d(ar1).ravel()
         ar2 = np.squeeze(np.atleast_1d(ar2))
         idx = np.searchsorted(ar2, ar1)
         valid_mask = idx < len(ar2)
@@ -376,7 +376,9 @@ class HierarchicalMesh():
             nodes_to_refine.add(self._get_node(at_level, idx))
             if refine_neighbours:
                 for n_idx in self._get_neighbour_indices(at_level, index=idx, p=disk_size):
-                    nodes_to_refine.add(self._get_node(at_level, n_idx))
+                    node_to_refine = self._get_node(at_level, n_idx)
+                    #print(f"neighbouring node to refine = {node_to_refine.index}")
+                    nodes_to_refine.add(node_to_refine)
         pass
             
 
@@ -395,7 +397,7 @@ class HierarchicalMesh():
 
             # Check neighbours' parents
             if node.level>0:
-                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.ps[0]-1)
+                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.ps[0]-1)#self.ps[0]-1)
                 c_shape = self.meshes_shape[node.level - 1]
                 f_shape = self.meshes_shape[node.level]
                 for n_idx in neighbour_indices:
@@ -708,7 +710,7 @@ class HierarchicalMesh():
         """
 
         shape = self.meshes_shape[level]
-        return numba_get_neighbour_indices(index, shape, p).tolist()
+        #return numba_get_neighbour_indices(index, shape, p).tolist()
         coords = np.unravel_index(index, shape)
         neighbors = []
         allowed_offset = p# max(0,p-1)
@@ -805,7 +807,7 @@ class HierarchicalMesh():
                     height = 1.0 # arbitrary
                     
                     rect = plt.Rectangle((xmin, -height/2), width, height,
-                                         edgecolor='black',
+                                         edgecolor=colors[level],
                                          facecolor=colors[level],
                                          alpha=0.6,
                                          linewidth=1.5)
@@ -829,7 +831,7 @@ class HierarchicalMesh():
                                          edgecolor='black',
                                          facecolor=colors[level],
                                          alpha=0.6,
-                                         linewidth=1.5)
+                                         linewidth=.25)
                     ax.add_patch(rect)
                 pass
             pass
