@@ -121,7 +121,8 @@ class HierarchicalSpace():
         # self.get_all_active_functions_on_cell
         
 
-    def refine(self, marked_cells: list[int], level: int, axes=None, incremental=False, refine_neighbours=False):
+    def refine(self, marked_cells: list[int], level: int, axes=None, incremental=False, refine_neighbours=False,
+               refine_T_neighbours=False, m=2):
         """
         Refines the specified cells at a given level.
 
@@ -130,7 +131,14 @@ class HierarchicalSpace():
         :param marked_cells: List of flat cell indices at 'level' to refine.
         :param level: The level at which the marked_cells currently exist.
         :param axes: Optional list of axes to refine.
+        :param incremental: this should be left to `False` for now
+        :param refine_neighbours: Optional bool to refine around marked cells to be sure to get new degrees of freedom
+        :param refine_T_neigbours: Optional bool to refine neighbours such that at most splines of `m` different levels
+        act on the same cell.
+        :param m: Optional int to specify that splines of at most `m` different levels can act on each cell.
         """
+        if m:
+            assert m>=2
         assert level>=0, "Provided level must be non.negative."
         marked_cells = np.atleast_1d(marked_cells)
         if len(marked_cells) == 0:
@@ -139,6 +147,10 @@ class HierarchicalSpace():
         
         
         marked_cells = np.unique(marked_cells)
+        if refine_T_neighbours:
+            T_marked_cells = {level: marked_cells}
+            T_marked_cells = self.mark_recursive(T_marked_cells, l=level, m=m)
+        pass
         current_level = self.nlevels-1
         
         # If we are refining cells on the currently finest level, 
@@ -159,7 +171,12 @@ class HierarchicalSpace():
         # Update the physical mesh topology
         # This includes refining the current finest mesh, creating new CellNodes if necessary, 
         # and updating active/deactivated cells
-        self.hmesh.refine(marked_cells=marked_cells, at_level=level, refine_neighbours=refine_neighbours)
+        if refine_T_neighbours:
+            for l in range(level+1):
+                self.hmesh.refine(T_marked_cells[level], at_level=level, refine_neighbours=refine_neighbours)
+            pass
+        else:
+            self.hmesh.refine(marked_cells=marked_cells, at_level=level, refine_neighbours=refine_neighbours)
         
         if incremental:
             # Make sure that we are not refining an already refined cell.
@@ -311,7 +328,16 @@ class HierarchicalSpace():
             
         pass #for loop on number of levels
 
-  
+    def mark_recursive(self, marked, l, m):
+        neighbours = self.get_T_neighbourhood(marked[l], l, m)
+        if neighbours.size>0:
+            k = l-m+1
+            if k not in marked:
+                marked[k] = neighbours
+            else:
+                marked[k] = np.union1d(marked[k], neighbours)
+            marked = self.mark_recursive(marked=marked, l=k, m=m)
+        return marked
 
     def _update_active_functions_incremental(self, marked_cells: npt.NDArray[np.int_], level: int):
         """Updates active and deactivated functions when `marked_cells` at `level` have been refined to `level`+1. 
@@ -406,6 +432,42 @@ class HierarchicalSpace():
             self.Bl_minus[next_level] = np.flatnonzero(bl_minus_mask).astype(np.int32)
         pass
     pass
+
+    def get_multilevel_support_extension(self, cell_indices: int|list[int]|npt.NDArray[np.int_], cell_level: int, extension_level: int)->npt.NDArray[np.int_]:
+        """Given a cell `Q` of level `l`, there are basis functions {`b_k`} of level `k` that have support on `Q`. 
+        This function returns all cells `Q'` of level `k` that are included in the support of at least one basis function
+        in {`b_k`}."""
+        l=cell_level
+        k=extension_level
+        assert l>=k, "Extension level must be finer than cell level."
+        if k==l:
+            extension: npt.NDArray[np.int_] = self.level_spaces[l].get_support_extension(cell_indices)
+        else:
+            ancestors: npt.NDArray[np.int_] = self.hmesh.get_parent_at_level(start_level=l, stop_level=k, marked_cells_at_start_level=cell_indices)
+            extension = self.level_spaces[k].get_support_extension(ancestors)
+        return extension
+    
+    def get_T_neighbourhood(self, cell_indices: int|list[int]|npt.NDArray[np.int_], cell_level: int, m: int):
+        assert cell_level>=0
+        assert cell_level<self.nlevels
+        l=cell_level
+        k = l-m+2
+        if k-1<0:
+            return np.array([], dtype=np.int32)
+        extension = self.get_multilevel_support_extension(cell_indices=cell_indices, cell_level=cell_level, extension_level=k)
+        parents: npt.NDArray[np.int_] = self.hmesh.get_parent(level=k, marked_cells_at_level=extension)
+        active_elts: npt.NDArray[np.int_] = self.hmesh.aelem_level[k-1]
+        neighbourhood = np.intersect1d(parents, active_elts)
+        # unique_parents = np.unique(parents)
+        # if len(unique_parents)<len(active_elts):
+        #     mask = sorted_isin(unique_parents, active_elts)
+        #     neighbourhood = unique_parents[mask]
+        # else:
+        #     mask = sorted_isin(active_elts, unique_parents)
+        #     neighbourhood = active_elts[mask]
+            
+        return neighbourhood
+
 
     def _truncation_operator(self, element_idx: int, element_level: int, l: int)->sp.csc_array:
         """
@@ -541,7 +603,19 @@ class HierarchicalSpace():
             
         return M
     
-    def local_multi_level_extraction_operator2(self, element_indices: list[int], element_level, l)->list[sp.csr_array]:
+    def local_multi_level_extraction_operator2(self, element_indices: list[int], element_level: int, l: int)->list[npt.NDArray[np.float64]]:
+        """Returns the local multi-level extraction operators for all elements listed in `element_indices` of the same level 
+        `element_level`.
+        
+        This method is more efficient than calling `local_multi_level_extraction_operator()` several times, as many computations are vectorised 
+        in the current method..
+        
+        :param element_indices: indices of all levels for which the local multi-level extration operators are to be computed
+        :param element_level: level to which `element_indices` belong to
+        :param l: level of the extraction matrices. This is usually set to the finest level of the mesh.
+
+        :returns Ms: list of numpy arrays, with all the local multi-level extraction operators.
+        """
         element_indices = np.atleast_1d(element_indices)
         if element_indices.size==0:
             return
@@ -612,7 +686,7 @@ class HierarchicalSpace():
             
             return Rs_sliced
         
-        dtype = self.level_spaces[0].spaces[0].Rs[0].dtype
+        # dtype = self.level_spaces[0].spaces[0].Rs[0].dtype
         # get parents of cells at coarsest level
         # If n cells have the same parent, the index of the parent is returned n times.
         cells_level: npt.NDArray[np.int_] = self.hmesh.get_parent_at_level(start_level=element_level, 
@@ -924,7 +998,7 @@ class HierarchicalSpace():
 
         return M
 
-    def refine_in_rectangle(self, rectangle: npt.NDArray, level: int, refine_neighbours=False):
+    def refine_in_rectangle(self, rectangle: npt.NDArray, level: int, refine_neighbours=False, refine_T_neighbours=False, m=2):
         """
         Refines the mesh from `level` to `level`+1. All cells that intersect with the rectangle are refined up to a suitable level.
         This is to avoid L-shaped domains.
@@ -965,7 +1039,8 @@ class HierarchicalSpace():
         active_indices = find_intersecting_geometrically(0)
         if active_indices is None:
             return
-        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours)
+        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours,
+                    refine_T_neighbours=refine_T_neighbours, m=m)
 
         for l in range(1, level+1):
                 # _, children_cells = self.hmesh.get_children(level=l-1, marked_cells_at_level=active_indices)
@@ -973,9 +1048,10 @@ class HierarchicalSpace():
                 active_indices = find_intersecting_geometrically(l)
                 if active_indices is None:
                     return
-                self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours)
+                self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours,
+                            refine_T_neighbours=refine_T_neighbours, m=m)
 
-    def refine_in_rectangles(self, rectangles, level, refine_neighbours=False):
+    def refine_in_rectangles(self, rectangles, level, refine_neighbours=False, refine_T_neighbours=False, m=2):
         """
         Refines the mesh from `level` to `level`+1. All cells that intersect with 
         ANY of the provided rectangles are refined up to a suitable level.
@@ -1033,13 +1109,15 @@ class HierarchicalSpace():
         if active_indices is None:
             return
             
-        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours)
+        self.refine(marked_cells=active_indices, level=0, refine_neighbours=refine_neighbours,
+                    refine_T_neighbours=refine_T_neighbours, m=m)
 
         for l in range(1, level + 1):
             active_indices = find_intersecting_geometrically(l)
             if active_indices is None:
                 return
-            self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours)
+            self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours,
+                        refine_T_neighbours=refine_T_neighbours, m=m)
         
 
     def plot_overloading(self, filename=None, text=False, fontsize=None):
