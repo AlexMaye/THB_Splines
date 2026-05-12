@@ -83,7 +83,7 @@ def sorted_isin(ar1: npt.NDArray, ar2: npt.NDArray)->npt.NDArray[np.bool_]:
         No checks are performed to ensure this.
         """
         ar1 = np.atleast_1d(ar1).ravel()
-        ar2 = np.squeeze(np.atleast_1d(ar2))
+        ar2 = np.atleast_1d(ar2).ravel()
         idx = np.searchsorted(ar2, ar1)
         valid_mask = idx < len(ar2)
         vals_to_keep = np.zeros(len(ar1), dtype=bool)
@@ -675,7 +675,6 @@ class HierarchicalMesh():
             marked_cells = np.ravel_multi_index(multi_indices, shape)
             
         return marked_cells
-
 
     def _get_neighbour_indices_all_directions(self, level:int, index:int, buffer_width=1)->list[int]:
         """

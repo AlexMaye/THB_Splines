@@ -153,6 +153,22 @@ def numba_cell_to_basis_indices(cell_indices:npt.NDArray[np.int_], cell_to_last_
     j = cell_to_last_knot[cell_indices]
     offsets = np.arange(-degree, 1, dtype=j.dtype)
     return j[:, None]+offsets[None, :]
+
+#@jit(nopython=True)
+def morton_2d(ix, iy, k=32):
+        code = 0
+        for i in range(k):
+            code |= (ix&(1<<i))<<i | (iy&(1<<i))<<(i+1)
+        return code
+
+#@jit(nopython=True)
+def quantised_to_morton(quantised_midpoints, k=32):
+    N = len(quantised_midpoints)
+    morton_code = np.empty(N, dtype=np.int32)
+    for i in range(N):
+        morton_code[i] = morton_2d(quantised_midpoints[0], quantised_midpoints[1], k)
+
+
     
 
 class UnivariateSplineSpace():
@@ -303,7 +319,7 @@ class UnivariateSplineSpace():
         Returns the indices of the physical cells supported by these basis functions.
         """
         # Basis 'i' is defined by the knot span [u_i, u_{i+p+1}]
-        basis_indices = np.atleast_1d(basis_indices)
+        basis_indices = np.atleast_1d(basis_indices).ravel()
         assert np.max(basis_indices)<self.nfuncs, "The space does not have as many functions."
         assert np.min(basis_indices)>=0, "Indices must be non-negative."
         start_knot_idxs = basis_indices
@@ -314,7 +330,7 @@ class UnivariateSplineSpace():
         end_cells = self.knot_to_unique[end_knot_idxs]
 
         if len(basis_indices)==1:
-            return [np.arange(start_cells, end_cells, dtype=np.int32)]
+            return [np.arange(start_cells[0], end_cells[0], dtype=np.int32)]
         
         # Return the range of cells
         # A list comprehension is necessary since BSplines do not span over the same amount of cells
@@ -482,6 +498,9 @@ class UnivariateSplineSpace():
 
         return [np.arange(start, end + 1, dtype=np.int32) 
             for start, end in zip(j_min, j_max)]
+    
+    def middle_point(self, indices)->npt.NDArray[np.float64]:
+        return np.mean(self.local_knots[indices], axis=-1)
 
 
 class TensorProductSpace():
@@ -704,7 +723,7 @@ class TensorProductSpace():
         """
         return self.cell_supports[basis_indices]
 
-    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_]) -> npt.NDArray[np.int_]:
+    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_]) -> list[npt.NDArray[np.int_]]:
         """
         Returns the indices of cells in the support of the passed basis
         indices. The 'inverse' of cell_to_basis.
@@ -712,6 +731,7 @@ class TensorProductSpace():
         :param basis_indices: a list/array of indices
         :return: a nested list of index-sets corresponding to cells in the support of the provided basis functions.
         """
+        basis_indices = np.asarray(basis_indices).ravel()
         if len(basis_indices)==0:
             print('No basis list was provided in basis_to_cell.')
             return np.array([], dtype=np.int32)
@@ -791,6 +811,28 @@ class TensorProductSpace():
         # Flatten the array and return unique basis indices
         #return np.unique(flat_basis_nd)
 
+    def get_support_extension(self, indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray[np.int_]:
+        """Given cell indices, this function returns the support extension of these cells, i.e for a cell Q,
+        this function returns all cells Q' who are included in the support of at least one basis function
+        supported on Q.
+        """
+        indices = np.array(indices)
+        if indices.size==0:
+            return
+        assert np.max(indices)<np.prod(self.mesh_shape), "There are not as many cells at this level"
+        assert np.min(indices)>=0, "Cell indices must be non-negative."
+
+        supported_functions = self.cell_to_basis(indices)
+        extended_support_list: list[npt.NDArray[np.int_]] = self.basis_to_cell(supported_functions)
+        if extended_support_list:
+            # Concatenate all 1D arrays and find unique elements
+            extended_support = np.unique(np.concatenate(extended_support_list))
+        else:
+            # Fallback for an empty list
+            extended_support = np.array([], dtype=np.int32)
+            
+        return extended_support
+
     def get_children_functions(self, indices: int|list[int]|npt.NDArray[np.int_])->list[npt.NDArray[np.int32]]:
         """
         Returns functions that are children of the given functions, given a dyadic refinement of the mesh.
@@ -828,6 +870,31 @@ class TensorProductSpace():
             children_funcs.append(flat_children_k.flatten().astype(np.int32))
             
         return children_funcs
+    
+    def middle_points(self, indices)->npt.NDArray[np.float64]:
+        """
+        Computes the "middle" point.
+
+        :param indices: indices of basis functions 
+        :return middles: numpy array of shape(#indices, dim) with the middle point of each index on each row
+        """
+        indices = np.array(indices)
+        multi_index = np.unravel_index(indices, self.nfuncs_onedim)
+        middles = np.empty((len(indices), self.dim), dtype=np.float64)
+        for d in range(self.dim):
+            middles[:, d] = self.spaces[d].middle_point(multi_index[d])
+        return middles
+    
+    def quantisation(self, midpoints, k=32):
+        quantised = self.empty_like(midpoints)
+        for d in range(self.dim):
+            coords = midpoints[:, d]
+            my_max = self.spaces[d].knots[-1]
+            my_min = self.spaces[d].knots[0]
+            quantised[:, d] = np.floor((coords-my_min)/(my_max-my_min)*((1<<k)-1))
+
+        return quantised
+
     
     def get_refinement_operator(self, index: int):
         """
