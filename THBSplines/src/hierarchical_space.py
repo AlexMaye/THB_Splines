@@ -834,6 +834,34 @@ class HierarchicalSpace():
             pass
         pass
         return dof_map, next_id-1
+
+    def build_morton_dof_map(self)->tuple[dict[int, int], int]:
+        from THBSplines.src.tensor_product_space import quantised_to_morton
+        
+        total_active = sum(len(self.truly_active.get(l, [])) for l in range(self.nlevels))
+        quantised = np.empty((total_active, self.dim), dtype=np.int64)
+        a = 0
+        truly_active_list = []
+        for l in range(self.nlevels):
+            active_l = self.truly_active.get(l, [])
+            n_l = len(active_l)
+            if n_l==0:
+                continue
+            b = a+n_l
+            midpoints_l: npt.NDArray[np.float64] = self.level_spaces[l].middle_points(active_l)
+            quantised_l: npt.NDArray[np.float64] = self.level_spaces[l].quantisation(midpoints_l, k=31)
+            quantised[a:b] = quantised_l.astype(np.int64)
+            truly_active_list.extend((l, idx) for idx in active_l)
+            a = b
+        pass
+
+        morton: npt.NDArray[np.int64] = quantised_to_morton(quantised_midpoints=quantised)
+        dof_order = np.argsort(morton)
+
+        dof_map = {truly_active_list[idx]: i for i, idx in enumerate(dof_order)}
+    
+        return dof_map, len(dof_map) - 1
+        
     
     def element_global_indices(self, element_idx: int, element_level: int, dof_map: dict)->list[int]:
         """

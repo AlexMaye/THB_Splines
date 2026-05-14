@@ -154,19 +154,16 @@ def numba_cell_to_basis_indices(cell_indices:npt.NDArray[np.int_], cell_to_last_
     offsets = np.arange(-degree, 1, dtype=j.dtype)
     return j[:, None]+offsets[None, :]
 
-#@jit(nopython=True)
-def morton_2d(ix, iy, k=32):
-        code = 0
-        for i in range(k):
-            code |= (ix&(1<<i))<<i | (iy&(1<<i))<<(i+1)
-        return code
-
-#@jit(nopython=True)
-def quantised_to_morton(quantised_midpoints, k=32):
-    N = len(quantised_midpoints)
-    morton_code = np.empty(N, dtype=np.int32)
-    for i in range(N):
-        morton_code[i] = morton_2d(quantised_midpoints[0], quantised_midpoints[1], k)
+from THBSplines.src.pymorton import interleave2, interleave3
+def quantised_to_morton(quantised_midpoints: npt.NDArray[np.int64])->npt.NDArray[np.int64]:
+    dim = quantised_midpoints.shape[1]
+    
+    if dim == 2:
+        return interleave2(quantised_midpoints[:, 0], quantised_midpoints[:, 1])
+    elif dim == 3:
+        return interleave3(quantised_midpoints[:, 0], quantised_midpoints[:, 1], quantised_midpoints[:, 2])
+    else:
+        raise ValueError(f"Morton encoding not implemented for dim={dim}")
 
 
     
@@ -608,22 +605,22 @@ class TensorProductSpace():
         
         # self._set_bezier_and_refinements(mode=mode)
 
-        #self.no_internal_multiplicity = all([space.no_internal_multiplicity for space in self.spaces])
-        #if self.no_internal_multiplicity:
-        #    self.boundary_cells, self.interior_cells = self.get_cell_classification()
-        
-        #    interior00 = np.unravel_index(self.interior_cells[0], shape=self.next_mesh_shape)
-            #interior10 = np.array(interior00)+np.array([1,0])
-            #interior01 = np.array(interior00)+np.array([0,1])
-            #interior11 = np.array(interior00)+np.array([1,1])
+        # self.no_internal_multiplicity = all([space.no_internal_multiplicity for space in self.spaces])
+        # if self.no_internal_multiplicity and all(self.degrees[i]==2 for i in range(self.dim)):
+        #     self.boundary_cells, self.interior_cells = self.get_cell_classification()
 
-            #matrices00 = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, interior00)]
-            #self.interior_refinement_kron = reduce(lambda x,y: sp.csc_array(sp.kron(x,y, format='csc')), matrices)
-            #self.interior_refinement_kron00 = reduce(lambda x,y: np.kron(x,y), matrices00)
-            #self.interior_refinement_kron00 = self._form_kron_matrices(interior00, np.array([0,0]))
-            #self.interior_refinement_kron01 = self._form_kron_matrices(interior00, np.array([0,1]))
-            #self.interior_refinement_kron10 = self._form_kron_matrices(interior00, np.array([1,0]))
-            #self.interior_refinement_kron11 = self._form_kron_matrices(interior00, np.array([1,1]))
+        #     interior00 = np.unravel_index(self.interior_cells[0], shape=self.next_mesh_shape)
+        #     interior10 = np.array(interior00)+np.array([1,0])
+        #     interior01 = np.array(interior00)+np.array([0,1])
+        #     interior11 = np.array(interior00)+np.array([1,1])
+
+        #     matrices00 = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, interior00)]
+        #     #self.interior_refinement_kron = reduce(lambda x,y: sp.csc_array(sp.kron(x,y, format='csc')), matrices)
+        #     self.interior_refinement_kron00 = reduce(lambda x,y: np.kron(x,y), matrices00)
+        #     self.interior_refinement_kron00 = self._form_kron_matrices(interior00, np.array([0,0]))
+        #     self.interior_refinement_kron01 = self._form_kron_matrices(interior01, np.array([0,1]))
+        #     self.interior_refinement_kron10 = self._form_kron_matrices(interior10, np.array([1,0]))
+        #     self.interior_refinement_kron11 = self._form_kron_matrices(interior11, np.array([1,1]))
 
 
     def _form_kron_matrices(self, base_index, offset):
@@ -885,15 +882,15 @@ class TensorProductSpace():
             middles[:, d] = self.spaces[d].middle_point(multi_index[d])
         return middles
     
-    def quantisation(self, midpoints, k=32):
-        quantised = self.empty_like(midpoints)
-        for d in range(self.dim):
-            coords = midpoints[:, d]
-            my_max = self.spaces[d].knots[-1]
-            my_min = self.spaces[d].knots[0]
-            quantised[:, d] = np.floor((coords-my_min)/(my_max-my_min)*((1<<k)-1))
-
-        return quantised
+    def quantisation(self, midpoints:npt.NDArray[np.float_], k:int=31)->npt.NDArray[np.int64]:
+        """Maps floating points to integers. Default is `k=31` to use signed numbers on 32 bits."""
+        #quantised = np.empty_like(midpoints)
+        multiply_by = (1<<k)-1
+        my_min = np.array([self.spaces[d].knots[0] for d in range(self.dim)])
+        my_max = np.array([self.spaces[d].knots[-1] for d in range(self.dim)])
+        
+        quantised = np.floor((midpoints - my_min) / (my_max - my_min) * multiply_by)
+        return quantised.astype(np.int64)
 
     
     def get_refinement_operator(self, index: int):
@@ -910,7 +907,8 @@ class TensorProductSpace():
         #return sp.csc_array(kron_product)
         return reduce(lambda x,y: np.kron(x,y), matrices)
     
-    def get_refinement_operators(self, indices:list[int])->list[sp.csc_array]:
+    def get_refinement_operators(self, indices:list[int])->list[npt.NDArray[np.float_]]:
+        
         indices = np.unravel_index(indices, shape=self.next_mesh_shape)
         matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
         if not matrices:
@@ -922,25 +920,24 @@ class TensorProductSpace():
         #return kron_product
         return [reduce(lambda x,y: np.kron(np.squeeze(x),np.squeeze(y)), matrix) for matrix in matrices]
     
-    # def get_refinement_operators_optimised(self, indices:list[int])->list[sp.csc_array]:
-    #     """This does not work yet"""
+    def _get_refinement_operators_optimised(self, indices:list[int])->list[sp.csc_array]:
+        return
+        indices = np.array(indices)
+        if self.no_internal_multiplicity:
+            _,  interior_cells = self.get_cell_classification()
+            can_skip_computation = np.isin(indices, interior_cells)
+        else:
+            can_skip_computation = np.zeros_like(indices, dtype=bool)
+        kron_products = []
+        # for idx1, index in enumerate(indices):
+        #     if not can_skip_computation[idx1]:
+        #         kron_products.append(self.get_refinement_operator(index))
+        #     else:
+        #         kron_products.append(self.interior_refinement_kron)
+        kron_products = [self.get_refinement_operator(index) if not can_skip_computation[idx] 
+                         else self.interior_refinement_kron for idx, index in enumerate(indices)]
         
-    #     indices = np.array(indices)
-    #     if self.no_internal_multiplicity:
-    #         _,  interior_cells = self.get_cell_classification()
-    #         can_skip_computation = np.isin(indices, interior_cells)
-    #     else:
-    #         can_skip_computation = np.zeros_like(indices, dtype=bool)
-    #     kron_products = []
-    #     # for idx1, index in enumerate(indices):
-    #     #     if not can_skip_computation[idx1]:
-    #     #         kron_products.append(self.get_refinement_operator(index))
-    #     #     else:
-    #     #         kron_products.append(self.interior_refinement_kron)
-    #     kron_products = [self.get_refinement_operator(index) if not can_skip_computation[idx] 
-    #                      else self.interior_refinement_kron for idx, index in enumerate(indices)]
-        
-    #     return kron_products
+        return kron_products
 
     def get_bezier_operator(self, index: int):
         indices = np.unravel_index(index, shape=self.mesh_shape)
