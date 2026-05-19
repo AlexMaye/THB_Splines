@@ -3,3 +3,6 @@
 *.so
 *.c
 *.html
+*.bp
+*.prof
+*.7z
