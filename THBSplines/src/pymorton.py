@@ -110,10 +110,10 @@ def interleave2(*args):
 def interleave3(*args):
     if len(args) != 3:
         raise ValueError('Usage: interleave3(x, y, z)')
-    for arg in args:
-        if not isinstance(arg, int):
-            print('Usage: interleave3(x, y, z)')
-            raise ValueError("Supplied arguments contain a non-integer!")
+    # for arg in args:
+    #     if not isinstance(arg, int):
+    #         print('Usage: interleave3(x, y, z)')
+    #         raise ValueError("Supplied arguments contain a non-integer!")
 
     return __part1by2(args[0]) | (__part1by2(args[1]) << 1) | (
         __part1by2(args[2]) << 2)
