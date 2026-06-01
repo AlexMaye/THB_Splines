@@ -166,7 +166,69 @@ def quantised_to_morton(quantised_midpoints: npt.NDArray[np.int64])->npt.NDArray
         raise ValueError(f"Morton encoding not implemented for dim={dim}")
 
 
-    
+@jit(nopython=True)
+def compute_nd_cells_numba(start_cells, end_cells, strides, dim):
+    num_bases = start_cells.shape[1]
+
+    total_elements=0
+    # How many cells each basis function spans
+    lengths = np.empty(num_bases, dtype=np.int32)
+    for i in range(num_bases):
+        size=1
+        for d in range(dim):
+            size *= max(0, end_cells[d,i]-start_cells[d,i])
+        pass
+        lengths[i] = size
+        total_elements+=size
+    pass
+    flat_cells = np.empty(total_elements, dtype=np.int32)
+    offsets = np.empty(num_bases + 1, dtype=np.int32)
+    offsets[0] = 0
+
+    current_idx = 0
+    for i in range(num_bases):
+        if lengths[i] == 0:
+            offsets[i+1] = current_idx
+            continue
+            
+        # Fast paths for the most common dimensions
+        if dim == 1:
+            for x in range(start_cells[0, i], end_cells[0, i]):
+                flat_cells[current_idx] = x * strides[0]
+                current_idx += 1
+        elif dim == 2:
+            for x in range(start_cells[0, i], end_cells[0, i]):
+                val_x = x * strides[0]
+                for y in range(start_cells[1, i], end_cells[1, i]):
+                    flat_cells[current_idx] = val_x + y * strides[1]
+                    current_idx += 1
+        elif dim == 3:
+            for x in range(start_cells[0, i], end_cells[0, i]):
+                val_x = x * strides[0]
+                for y in range(start_cells[1, i], end_cells[1, i]):
+                    val_xy = val_x + y * strides[1]
+                    for z in range(start_cells[2, i], end_cells[2, i]):
+                        flat_cells[current_idx] = val_xy + z * strides[2]
+                        current_idx += 1
+        else:
+            # Fallback for General N-Dimensions
+            shape = np.empty(dim, dtype=np.int32)
+            for d in range(dim):
+                shape[d] = end_cells[d, i] - start_cells[d, i]
+            
+            for j in range(lengths[i]):
+                temp = j
+                val = 0
+                # Evaluate from inner-most to outer-most dimension (C-contiguous behavior)
+                for d in range(dim-1, -1, -1):
+                    val += (start_cells[d, i] + temp % shape[d]) * strides[d]
+                    temp //= shape[d]
+                flat_cells[current_idx] = val
+                current_idx += 1
+                
+        offsets[i+1] = current_idx
+        
+    return flat_cells, offsets
 
 class UnivariateSplineSpace():
     """
@@ -729,30 +791,54 @@ class TensorProductSpace():
         :return: a nested list of index-sets corresponding to cells in the support of the provided basis functions.
         """
         basis_indices = np.asarray(basis_indices).ravel()
-        if len(basis_indices)==0:
+        num_bases = len(basis_indices)
+        if num_bases==0:
             print('No basis list was provided in basis_to_cell.')
             return np.array([], dtype=np.int32)
         
         #grid_shape = self.mesh_shape
         tensor_idx = np.unravel_index(basis_indices, self.nfuncs_onedim)
-        cells_1d = []
-        for d in range(self.dim):
-            cells_1d.append(self.spaces[d].basis_to_cell_indices(tensor_idx[d]))
-        
-        nd_cells_list = []
 
-        for i in range(len(basis_indices)):
-            # Extract the 1D cell arrays for the i-th basis function across all dimensions
-            grids_1d = [cells_1d[d][i] for d in range(self.dim)]
+        start_cells = np.empty((self.dim, num_bases), dtype=np.int32)
+        end_cells = np.empty((self.dim, num_bases), dtype=np.int32)
+
+        for d in range(self.dim):
+            space = self.spaces[d]
+            idx_1d = tensor_idx[d]
             
-            # Create the Cartesian product of these 1D cell arrays
-            mesh_grids = np.meshgrid(*grids_1d, indexing='ij')
+            # Vectorized extraction mapping knots to cells (bypasses creating lists of arrays)
+            start_cells[d, :] = space.knot_to_unique[idx_1d]
+            end_cells[d, :] = space.knot_to_unique[idx_1d + space.degree + 1]
+
+        # step size in a flattened 1D array to move one position along a specific axis in N dimensions
+        strides = np.empty(self.dim, dtype=np.int32)
+        s = 1
+        for d in range(self.dim - 1, -1, -1):
+            strides[d] = s
+            s *= self.mesh_shape[d]
             
-            flat_cells = np.ravel_multi_index(tuple(mesh_grids), self.mesh_shape)
+        flat_cells, offsets = compute_nd_cells_numba(start_cells, end_cells, strides, self.dim)
+        
+        return [flat_cells[offsets[i]:offsets[i+1]] for i in range(num_bases)]
+        
+        # cells_1d = []
+        # for d in range(self.dim):
+        #     cells_1d.append(self.spaces[d].basis_to_cell_indices(tensor_idx[d]))
+        
+        # nd_cells_list = []
+
+        # for i in range(len(basis_indices)):
+        #     # Extract the 1D cell arrays for the i-th basis function across all dimensions
+        #     grids_1d = [cells_1d[d][i] for d in range(self.dim)]
             
-            nd_cells_list.append(flat_cells.ravel())
+        #     # Create the Cartesian product of these 1D cell arrays
+        #     mesh_grids = np.meshgrid(*grids_1d, indexing='ij')
             
-        return nd_cells_list
+        #     flat_cells = np.ravel_multi_index(tuple(mesh_grids), self.mesh_shape)
+            
+        #     nd_cells_list.append(flat_cells.ravel())
+            
+        # return nd_cells_list
     
     def _cell_to_basis(self, cell_indices: int|list[int]|npt.NDArray[np.int_])->npt.NDArray[np.int_]:
         """Returns the indices of the function supported in the given list of cells.
@@ -899,9 +985,28 @@ class TensorProductSpace():
         """
         indices = np.unravel_index(index, shape=self.next_mesh_shape)
         
-        matrices = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, indices)]
-        if not matrices:
+        # space.Rs is a 3d numpy array of shape (#cells, degree+1, degree+1)
+        matrices: list[npt.NDArray[np.float64]] = [np.squeeze(space.Rs[idx]) for space, idx in zip(self.spaces, indices)]
+        dim = len(matrices)
+        if dim==0:
             return None
+        if dim==1:
+            return matrices[0]
+        elif dim==2:
+            A, B = matrices
+            # Shape transformations: (r1, 1, c1, 1) * (1, r2, 1, c2) -> (r1, r2, c1, c2)
+            return (A[:, None, :, None] * B[None, :, None, :]).reshape(
+                A.shape[0] * B.shape[0], 
+                A.shape[1] * B.shape[1]
+            )
+        elif dim == 3:
+            A, B, C = matrices
+            return (A[:, None, None, :, None, None] * 
+                    B[None, :, None, None, :, None] * 
+                    C[None, None, :, None, None, :]).reshape(
+                A.shape[0] * B.shape[0] * C.shape[0], 
+                A.shape[1] * B.shape[1] * C.shape[1]
+            )
         # Nothing happens if the list only has one element: a numpy array is kept.
         #kron_product = reduce(lambda x, y: sp.kron(x,y,format='csc'), matrices)
         #return sp.csc_array(kron_product)
@@ -911,15 +1016,41 @@ class TensorProductSpace():
         
         indices = np.unravel_index(indices, shape=self.next_mesh_shape)
         matrices = [space.Rs[idx] for space, idx in zip(self.spaces, indices)]
-        if not matrices:
+        dim = len(matrices)
+        if dim==0:
             return None
-        # Transpose the list of matrices
-        matrices = [list(i) for i in zip(*matrices)]
-        #kron_product = [sp.csc_array(reduce(lambda x,y: sp.kron(np.squeeze(x), np.squeeze(y), format='csc'),
-        #                       matrix)) for matrix in matrices]
-        #return kron_product
-        return [reduce(lambda x,y: np.kron(np.squeeze(x),np.squeeze(y)), matrix) for matrix in matrices]
-    
+        if dim==1:
+            return list(matrices[0])
+        elif dim==2:
+            A, B = matrices
+            # Vectorized explicit broadcast over N items at once
+            # A: (N, r1, c1) -> (N, r1, 1, c1, 1)
+            # B: (N, r2, c2) -> (N, 1, r2, 1, c2)
+            kron_array = (A[:, :, None, :, None] * B[:, None, :, None, :]).reshape(
+                A.shape[0],                 # N
+                A.shape[1] * B.shape[1],    # Combined Rows
+                A.shape[2] * B.shape[2]     # Combined Cols
+            )
+            return list(kron_array)
+        elif dim == 3:
+            A, B, C = matrices
+            kron_array = (A[:, :, None, None, :, None, None] * 
+                        B[:, None, :, None, None, :, None] * 
+                        C[:, None, None, :, None, None, :]).reshape(
+                A.shape[0],                                 # N
+                A.shape[1] * B.shape[1] * C.shape[1],       # Combined Rows
+                A.shape[2] * B.shape[2] * C.shape[2]        # Combined Cols
+            )
+            return list(kron_array)
+            
+        else:
+            # Transpose the list of matrices
+            matrices = [list(i) for i in zip(*matrices)]
+            #kron_product = [sp.csc_array(reduce(lambda x,y: sp.kron(np.squeeze(x), np.squeeze(y), format='csc'),
+            #                       matrix)) for matrix in matrices]
+            #return kron_product
+            return [reduce(lambda x,y: np.kron(np.squeeze(x),np.squeeze(y)), matrix) for matrix in matrices]
+        
     def _get_refinement_operators_optimised(self, indices:list[int])->list[sp.csc_array]:
         return
         indices = np.array(indices)
