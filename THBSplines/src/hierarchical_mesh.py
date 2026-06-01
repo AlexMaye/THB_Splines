@@ -137,7 +137,7 @@ class HierarchicalMesh():
         coordinates vector for each level and each dimension
     - meshes_shape:
         number of cells per level and per dimension
-    - nodes: dict{int, CellNode}
+    - nodes: dict[int, dict[int, CellNode]]
         lists of cells for each level
     - aelem_level: dict{int, np.ndarray}
         list of active cells for each level l
@@ -225,13 +225,14 @@ class HierarchicalMesh():
         return refined
 
 
-    def refine(self, marked_cells: npt.NDArray[np.int_]|list[int], at_level: int, refine_neighbours:bool=False):
+    def refine(self, marked_cells: npt.NDArray[np.int_]|list[int], at_level: int, refine_neighbours:bool=False, admissible_m:int = None):
         """
         Refines the hierarchical mesh, and updates the global element indices
         of active elements for each level.
 
         :param marked_cells: indices of cells marked for refinement
         :param at_level: level at which the refinement should take place
+        :param admissible_m: size of buffer zone around the refined cells to get admissible meshes. Defaults to `degrees[0]-1`
         :return: updated elements
         """
         assert at_level>=0, "Cells of negative level do not exist."
@@ -253,7 +254,7 @@ class HierarchicalMesh():
         
 
         # old_active_cells = self.aelem_level
-        self._update_active_cells(marked_cells, at_level=at_level, refine_neighbours=refine_neighbours)
+        self._update_active_cells(marked_cells, at_level=at_level, refine_neighbours=refine_neighbours, admissible_m = admissible_m)
         self.nel=0
         for l in range(self.nlevels):
             self.aelem_level[l] = np.array(sorted(list(self._aelem_level_set[l])), dtype=self.aelem_level[0].dtype)
@@ -361,14 +362,18 @@ class HierarchicalMesh():
         #     self.nodes[fine_level].append(child_node)
 
 
-    def _update_active_cells(self, marked_cells: list[int]|npt.NDArray[np.int_], at_level: int, refine_neighbours=False):
+    def _update_active_cells(self, marked_cells: list[int]|npt.NDArray[np.int_], at_level: int, refine_neighbours=False, admissible_m = None):
         """
         Updates the set of active cells and deactivated cells.
 
         :param marked_cells: indices of cells marked for refinement
+        :param admissible_m: size of buffer zone around the refined cells to get admissible meshes. Defaults to `degrees[0]-1`
         :return: returns the newly added cells
         """
         # Uniquely identify all cells to be refined at a certain level
+        if admissible_m is None:
+            # admissible_m = self.ps[0]-1
+            pass
         nodes_to_refine: set[CellNode] = set()
         if refine_neighbours:
             disk_size = ceil((self.dim-1)/4.)
@@ -396,8 +401,8 @@ class HierarchicalMesh():
             pass
 
             # Check neighbours' parents
-            if node.level>0:
-                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=self.ps[0]-1)#self.ps[0]-1)
+            if admissible_m is not None and node.level>0:
+                neighbour_indices = self._get_neighbour_indices(level=node.level, index=node.index, p=admissible_m)
                 c_shape = self.meshes_shape[node.level - 1]
                 f_shape = self.meshes_shape[node.level]
                 for n_idx in neighbour_indices:
