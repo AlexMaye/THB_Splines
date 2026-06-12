@@ -237,7 +237,8 @@ def fill_function_space(hierachical_space, mesh, N_max, thb_operators: dict, map
     C_func.x.scatter_forward()
     return C_func, C_space
 
-def create_spline_space(cells_to_dofs: npt.NDArray[np.int_], mesh, N_max:int, mult_factor:int=1, cell_type="quadrilateral"):
+def create_spline_space(cells_to_dofs: npt.NDArray[np.int_], mesh, N_max:int, mult_factor:int=1, cell_type="quadrilateral",
+                        dtype=np.float64):
     
     num_cells = mesh.topology.index_map(mesh.topology.dim).size_global
 
@@ -249,7 +250,8 @@ def create_spline_space(cells_to_dofs: npt.NDArray[np.int_], mesh, N_max:int, mu
         family="DG", 
         cell=cell_type, 
         degree=0, 
-        shape=(mult_factor*N_max,)
+        shape=(mult_factor*N_max,),
+        dtype=dtype
     )
     dummy_space = dolfinx_fem.functionspace(mesh=mesh, element=dummy_element)
     element_layout = dummy_space.dofmap.dof_layout
@@ -324,6 +326,55 @@ def dorfler_marking(hierarchical_space: HierarchicalSpace, theta: float,
         err_cells[level].append(my_arr[i])
 
     return err_cells
+
+def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterative=False):
+    A = assemble_matrix(a, bcs=[])
+    A.assemble()
+    one_active=False
+    two_active= False
+    for level in range(hs.nlevels):
+        if level in hs.truly_active and hs.truly_active[level].size>0:
+            if one_active:
+                two_active=True
+            one_active=True
+    A_mat = A
+    if two_active:
+        dummy_dof_index = np.max(dummy_index)
+        A_mat.setValue(dummy_dof_index, dummy_dof_index, 1., addv=PETSc.InsertMode.INSERT_VALUES)
+        A_mat.assemble()
+        A_mat.assemblyBegin()
+        A_mat.assemblyEnd()
+
+    b = assemble_vector(rhs)
+    if two_active:
+        b[dummy_dof_index] = 0.0
+        b.assemblyBegin()
+        b.assemblyEnd()
+
+    if dirichlet_indices is not None:
+        A_mat.zeroRowsColumns(dirichlet_indices, diag=1.0, x=None, b=b)
+        b.array_w[dirichlet_indices]=0.
+    b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+
+    ksp = PETSc.KSP().create(A_mat.comm)
+    ksp.setOperators(A_mat)
+    if iterative:
+        ksp.setType(PETSc.KSP.Type.CG)
+        ksp.getPC().setType(PETSc.PC.Type.JACOBI)
+    else:
+        ksp.setType(PETSc.KSP.Type.PREONLY)
+        ksp.getPC().setType(PETSc.PC.Type.LU)
+        ksp.getPC().setFactorSolverType("mumps")
+    u_sol = dolfinx_fem.Function(V_spline)
+    ksp.solve(b, u_sol.x.petsc_vec)
+    u_sol.x.scatter_forward()
+    u_vec=u_sol.x.array
+
+    ksp.destroy()
+    A.destroy()
+    b.destroy()
+
+    return u_vec
 
 def solve_problem_vector_field(hs, a, lhs, dirichlet_indices, dummy_index, V_spline, iterative=False):
     A = assemble_matrix(a, bcs=[])

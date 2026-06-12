@@ -1052,6 +1052,10 @@ class TensorProductSpace():
             return [reduce(lambda x,y: np.kron(np.squeeze(x),np.squeeze(y)), matrix) for matrix in matrices]
         
     def _get_refinement_operators_optimised(self, indices:list[int])->list[sp.csc_array]:
+        """
+        In theory, this method should used the cached Kronecker products to considerably speed up computations,
+        but a sound algorithm has not been derived yet.
+        """
         return
         indices = np.array(indices)
         if self.no_internal_multiplicity:
@@ -1163,42 +1167,6 @@ class TensorProductSpace():
         
     
     
-    @staticmethod #does not need to have access to class data or methods
-    def compute_projection_matrix(coarse_knots, fine_knots, degrees):
-        """
-        Computes the full 1D projection matrix of the space corresponding to the
-        fine knots with respect to the coarse knots and the spline degree.
-
-        :param coarse_knots: list/array of coarse knot vectors, one for each parametric direction
-        :param fine_knots: list/array of fine knot vectors, one for each parametric direction
-        :param degrees: list of spline degrees, one for each parametri direction.
-
-        :return: a list of 1D projection matrices corresponding to each parametric dimension
-        """
-        pass
-        # matrices = []
-        # for fine, coarse, degree in zip(fine_knots, coarse_knots, degrees):
-        #     coarse = augment_knots(coarse, degree)
-        #     fine = augment_knots(fine, degree)
-        #     m = len(fine) - (degree + 1)
-        #     n = len(coarse) - (degree + 1)
-
-        #     a = sp.lil_matrix((m, n), dtype=np.float64)
-        #     fine = np.array(fine, dtype=np.float64)
-        #     coarse = np.array(coarse, dtype=np.float64)
-        #     for i in range(m):
-        #         mu = find_knot_index(fine[i], coarse)
-        #         b = 1.
-        #         for k in range(1, degree + 1):
-        #             tau1 = coarse[mu - k + 1:mu + 1]
-        #             tau2 = coarse[mu + 1:mu + k + 1]
-        #             omega = (fine[i + k] - tau1) / (tau2 - tau1)
-        #             b = np.append((1 - omega) * b, 0) + np.insert((omega * b), 0, 0)
-        #         a[i, mu - degree:mu + 1] = b
-        #     matrices.append(a[degree + 1:-degree - 1, degree + 1:-degree - 1])
-
-        # return matrices
-
     def get_cells(self, basis_functions_list: np.ndarray) -> tuple[npt.NDArray, npt.NDArray]:
         """
         Given a list of indices corresponding to basis functions, return the
