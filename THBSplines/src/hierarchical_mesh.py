@@ -9,7 +9,7 @@ from math import ceil
 from numba import njit
 
 @njit
-def numba_get_neighbour_indices(index: int, shape: np.ndarray, p: int) -> np.ndarray:
+def numba_get_neighbour_indices(index: int, shape: npt.NDArray, p: int) -> npt.NDArray[np.int32]:
     dim = len(shape)
     coords = np.empty(dim, dtype=np.int32)
     temp = index
@@ -295,7 +295,7 @@ class HierarchicalMesh():
         """Safely instantiates all 2^dim children of a parent_node upon refinement."""
         if parent_node.children:
             #Don't do anything if the children already exist
-            return
+            return parent_node.children
             
         level = parent_node.level + 1
         if level not in self.nodes:
@@ -512,19 +512,6 @@ class HierarchicalMesh():
 
         parent_indices = np.ravel_multi_index(parent_coords, coarse_shape)
         return parent_indices
-        
-        if len(marked_cells_at_level)==1:
-            return self._get_node(level, marked_cells_at_level[0]).parent.index
-            return self.nodes[level][marked_cells_at_level[0]].parent.index
-
-        level_nodes = self.nodes[level]
-        indices = np.empty(len(marked_cells_at_level), dtype=int)
-        for i, idx in enumerate(marked_cells_at_level):
-            node: CellNode = self._get_node(level, idx)# level_nodes[idx]
-            parent_node: CellNode =  node.parent
-            indices[i] = parent_node.index
-        pass
-        return indices
     
     def get_parent_at_level(self, start_level: int, stop_level: int, marked_cells_at_start_level: npt.NDArray[np.int_])->npt.NDArray[np.int_]:
         """Returs parents of `marked_cells_at_start_level` at level `stop_level`. 
@@ -546,22 +533,16 @@ class HierarchicalMesh():
 
         if stop_level==start_level:
             return np.squeeze(marked_cells_at_start_level)
-        # if stop_level==start_level-1:
-        #     return self.get_parent(level=start_level, marked_cells_at_level=marked_cells_at_start_level, skip_assert=True)
         
-
-        # if len(marked_cells_at_start_level)==1:
-        #     parent_node = self._get_node(start_level, marked_cells_at_start_level[0]).parent# self.nodes[start_level][marked_cells_at_start_level[0]].parent
-        #     for _ in range(1, start_level-stop_level):
-        #         parent_node = parent_node.parent
-        #     pass
-        #     return parent_node.index
-        # pass
+        fine_shape = tuple(self.meshes_shape[start_level])
+        coarse_shape = tuple(self.meshes_shape[stop_level])
+        scale = 2 ** (start_level - stop_level)
         
-        for level in range(start_level, stop_level, -1):
-            marked_cells_at_start_level = self.get_parent(level=level, marked_cells_at_level=marked_cells_at_start_level, 
-                                                          skip_assert=True)
-        return marked_cells_at_start_level
+        child_coords = np.unravel_index(marked_cells_at_start_level, fine_shape)
+        parent_coords = tuple(c // scale for c in child_coords)
+        parents = np.ravel_multi_index(parent_coords, coarse_shape)
+        
+        return parents
     
     def _is_point_in_cell_geometry(self, node: CellNode, point: npt.NDArray)->bool:
         """Checks if a point is inside the bounding box of a specific node."""
