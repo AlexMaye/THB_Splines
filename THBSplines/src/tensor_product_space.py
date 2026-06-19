@@ -968,9 +968,12 @@ class TensorProductSpace():
             middles[:, d] = self.spaces[d].middle_point(multi_index[d])
         return middles
     
-    def quantisation(self, midpoints:npt.NDArray[np.float_], k:int=31)->npt.NDArray[np.int64]:
+    def quantisation(self, midpoints:npt.NDArray[np.float_], k:int=None)->npt.NDArray[np.int64]:
         """Maps floating points to integers. Default is `k=31` to use signed numbers on 32 bits."""
         #quantised = np.empty_like(midpoints)
+        if k is None:
+            k = (64//dim)-1
+
         multiply_by = (1<<k)-1
         my_min = np.array([self.spaces[d].knots[0] for d in range(self.dim)])
         my_max = np.array([self.spaces[d].knots[-1] for d in range(self.dim)])

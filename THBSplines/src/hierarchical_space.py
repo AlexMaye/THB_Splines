@@ -223,16 +223,16 @@ class HierarchicalSpace():
                 extended_support: list[npt.NDArray[np.int32]] = space_l.basis_to_cell(candidate_funcs)
                 has_active_parent = np.zeros_like(candidate_funcs, dtype=bool)
                 
-                if isinstance(extended_support, list):
-                    lens = np.fromiter((len(s) for s in extended_support), count=len(extended_support), dtype=np.int32)
-                    flat_support = np.concatenate(extended_support) if len(extended_support) > 0 else np.array([], dtype=np.int32)
-                else:
-                    extended_support = np.asarray(extended_support)
-                    lens = np.full(extended_support.shape[0], extended_support.shape[1], dtype=np.int32)
-                    flat_support = extended_support.ravel()
+                # if isinstance(extended_support, list):
+                #     lens = np.fromiter((len(s) for s in extended_support), count=len(extended_support), dtype=np.int32)
+                #     flat_support = np.concatenate(extended_support) if len(extended_support) > 0 else np.array([], dtype=np.int32)
+                # else:
+                #     extended_support = np.asarray(extended_support)
+                #     lens = np.full(extended_support.shape[0], extended_support.shape[1], dtype=np.int32)
+                #     flat_support = extended_support.ravel()
 
-                # rep_idx maps each cell in flat_support back to its parent candidate_func index
-                rep_idx = np.repeat(np.arange(len(candidate_funcs), dtype=np.int32), lens)
+                # # rep_idx maps each cell in flat_support back to its parent candidate_func index
+                # rep_idx = np.repeat(np.arange(len(candidate_funcs), dtype=np.int32), lens)
                 # rep_idx = [0,1,1, 2,2,2, ...]
                 # fine_shape = tuple(self.meshes_shape[l])
 
@@ -242,36 +242,36 @@ class HierarchicalSpace():
                         continue # skip the level if there are no active cells at this level
                     
                     # Don't check functions for which an active support cell of a coarser level has already been found
-                    unresolved_mask = ~has_active_parent 
-                    if not np.any(unresolved_mask):
-                        break # Early stopping: all candidates are already flagged
+                    # unresolved_mask = ~has_active_parent 
+                    # if not np.any(unresolved_mask):
+                    #     break # Early stopping: all candidates are already flagged
 
-                    # flat_support contains all individual cells that have at least one function supported on them.
-                    # Therefore, valid_flat_mask filters out the cells that correspond to functions which were already
-                    # resolved, e.g. we already know that the functions corresponding to those cells have an active parent
-                    valid_flat_mask = unresolved_mask[rep_idx]
-                    check_support = flat_support[valid_flat_mask]
-                    # keeps the arrays synchronised by removing function indices that were already resolved
-                    check_rep_idx = rep_idx[valid_flat_mask]
+                    # # flat_support contains all individual cells that have at least one function supported on them.
+                    # # Therefore, valid_flat_mask filters out the cells that correspond to functions which were already
+                    # # resolved, e.g. we already know that the functions corresponding to those cells have an active parent
+                    # valid_flat_mask = unresolved_mask[rep_idx]
+                    # check_support = flat_support[valid_flat_mask]
+                    # # keeps the arrays synchronised by removing function indices that were already resolved
+                    # check_rep_idx = rep_idx[valid_flat_mask]
 
-                    parents = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=check_support)
-                    is_active = sorted_isin(parents, active_cells_up)
+                    # parents = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=check_support)
+                    # is_active = sorted_isin(parents, active_cells_up)
 
-                    if np.any(is_active):
-                        has_active_parent[check_rep_idx[is_active]] = True
+                    # if np.any(is_active):
+                    #     has_active_parent[check_rep_idx[is_active]] = True
 
 
-                    # for candidate_idx, support in enumerate(extended_support):
-                    #     if has_active_parent[candidate_idx]:
-                    #         continue # don't modify the entry if an active parent has already been found
-                    #     # Get the parents at a coarser level
-                    #     # If two cells share the same parent, the index of the parent is returned twice
-                    #     parents: npt.NDArray[np.int32] = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=support)
-                    #     # Verify which are active
-                    #     active_parents = sorted_isin(parents, active_cells_up)
-                    #     # If at least one parent is active, the function is not `truly active`
-                    #     has_active_parent[candidate_idx] = np.any(active_parents)
-                    # pass
+                    for candidate_idx, support in enumerate(extended_support):
+                        if has_active_parent[candidate_idx]:
+                            continue # don't modify the entry if an active parent has already been found
+                        # Get the parents at a coarser level
+                        # If two cells share the same parent, the index of the parent is returned twice
+                        parents: npt.NDArray[np.int32] = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=support)
+                        # Verify which are active
+                        active_parents = sorted_isin(parents, active_cells_up)
+                        # If at least one parent is active, the function is not `truly active`
+                        has_active_parent[candidate_idx] = np.any(active_parents)
+                    pass
                 pass
             else:
                 candidate_funcs = np.array([], dtype=np.int32)
@@ -826,6 +826,8 @@ class HierarchicalSpace():
     
     def get_all_active_functions_on_cell(self, level: int, cell_idx: int)->dict[int, npt.NDArray[np.int32]]:
         """Given a cell at `level`, returns functions from all levels that are active on it.
+        This method does not take into account the truncated support of a THB-Spline.
+        However, this does not matter for the purposes of this method.
         
         Returns
         ------------
@@ -1085,6 +1087,45 @@ class HierarchicalSpace():
                 return
             self.refine(marked_cells=active_indices, level=l, refine_neighbours=refine_neighbours,
                         refine_T_neighbours=refine_T_neighbours, m=m)
+
+    def truncated_support(self) -> dict[tuple[int, int], list[tuple[int, npt.NDArray[np.int_]]]]:
+        """Returns the cells in the truncated support of each active B-Spline."""
+
+        funcs_truncated_support = {}
+        for l in range(self.nlevels):
+            for func in self.truly_active[l]:
+                same_level_support = self.level_spaces[l].basis_to_cell(func)
+                active_cells = np.intersect1d(same_level_support, self.hmesh.aelem_level[l])
+                inactive_cells = np.setdiff1d(same_level_support, self.hmesh.aelem_level[l])
+                funcs_truncated_support[(l, int(func))] = [(l, active_cells)]
+                if inactive_cells.size==0:
+                    continue
+                funcs_to_check = deepcopy(func) #Make sure there are no issues due to references
+                
+                for ll in range(l+1, self.nlevels):
+                    children_funcs = np.unique(np.concatenate(self.level_spaces[ll-1].get_children_functions(funcs_to_check)))
+                    kept_children = []
+                    for children in children_funcs:
+                        mask = ~np.isin(children, self.truly_active[ll])
+                        if not np.any(mask):
+                            continue
+                        kept_children.append(children[mask])
+                    if len(kept_children)==0:
+                        continue
+                    
+                    kept_children = np.unique(kept_children)
+                
+                    cells = np.intersect1d(self.hmesh.aelem_level[ll], 
+                                        np.concatenate(self.level_spaces[ll].basis_to_cell(kept_children)))
+                    
+                    if cells.size==0:
+                        continue
+                    funcs_truncated_support[(l, int(func))].extend((ll, cells))
+                    funcs_to_check = kept_children
+                pass #for ll
+            pass # for func
+        pass #for l
+        return funcs_truncated_support
         
 
 

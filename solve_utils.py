@@ -153,7 +153,6 @@ def build_dofmap(hierarchical_space, mesh, N_max, morton=False):
             
             # Get the local functions on the cell
             active_funcs_dict: dict[int, npt.NDArray[np.int_]] = hs.get_all_active_functions_on_cell(l, cell)
-            
                 
             #  Vectorized conversion from local to global indices
             mapped_arrays = [
@@ -327,7 +326,7 @@ def dorfler_marking(hierarchical_space: HierarchicalSpace, theta: float,
 
     return err_cells
 
-def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterative=False):
+def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterative=False, return_A=False):
     A = assemble_matrix(a, bcs=[])
     A.assemble()
     one_active=False
@@ -371,10 +370,13 @@ def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterativ
     u_vec=u_sol.x.array
 
     ksp.destroy()
-    A.destroy()
     b.destroy()
 
-    return u_vec
+    if not return_A:
+        A.destroy()
+        return u_vec
+    else:
+        return u_vec, A
 
 def solve_problem_vector_field(hs, a, lhs, dirichlet_indices, dummy_index, V_spline, iterative=False):
     A = assemble_matrix(a, bcs=[])
@@ -410,6 +412,7 @@ def solve_problem_vector_field(hs, a, lhs, dirichlet_indices, dummy_index, V_spl
         b.array_w[dirichlet_indices]=0.
     b.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
 
+    A_mat.setOption(PETSc.Mat.Option.SPD, True)
     ksp = PETSc.KSP().create(A_mat.comm)
     ksp.setOperators(A_mat)
     if iterative:
@@ -417,7 +420,7 @@ def solve_problem_vector_field(hs, a, lhs, dirichlet_indices, dummy_index, V_spl
         ksp.getPC().setType(PETSc.PC.Type.JACOBI)
     else:
         ksp.setType(PETSc.KSP.Type.PREONLY)
-        ksp.getPC().setType(PETSc.PC.Type.LU)
+        ksp.getPC().setType(PETSc.PC.Type.CHOLESKY)
         ksp.getPC().setFactorSolverType("mumps")
     u_sol = dolfinx_fem.Function(V_spline)
     ksp.solve(b, u_sol.x.petsc_vec)
