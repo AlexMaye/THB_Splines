@@ -1,5 +1,5 @@
 import numpy as np
-#from THBSplines.src.cartesian_mesh import CartesianMesh
+#from .cartesian_mesh import CartesianMesh
 #from scipy.spatial import KDTree
 from collections import deque
 import numpy.typing as npt

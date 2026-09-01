@@ -2,8 +2,8 @@ import numpy.typing as npt
 
 import numpy as np
 import scipy.sparse as sp
-from THBSplines.src.thbsplines.hierarchical_mesh import HierarchicalMesh, sorted_isin
-from THBSplines.src.thbsplines.tensor_product_space import TensorProductSpace, UnivariateSplineSpace
+from .hierarchical_mesh import HierarchicalMesh, sorted_isin
+from .tensor_product_space import TensorProductSpace, UnivariateSplineSpace
 from copy import deepcopy
 import itertools
 from math import prod
@@ -775,7 +775,7 @@ class HierarchicalSpace():
         return dof_map, next_id-1
 
     def build_morton_dof_map(self)->tuple[dict[int, int], int]:
-        from THBSplines.src.thbsplines.tensor_product_space import quantised_to_morton
+        from .tensor_product_space import quantised_to_morton
         
         total_active = sum(len(self.truly_active.get(l, [])) for l in range(self.nlevels))
         quantised = np.empty((total_active, self.dim), dtype=np.int64)
