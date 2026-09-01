@@ -606,6 +606,24 @@ class HierarchicalMesh():
         pass
         return (current_node.level, current_node.index)
     
+    def get_cell_midpoint(self, cell_indices, level, perturbation=False):
+
+        knots: list[npt.NDArray] = self.one_d_indices[level]
+        cell_multi_indices = np.unravel_index(cell_indices, tuple([len(knot)-1 for knot in knots]))
+
+        if perturbation:
+            interval_length = min([np.min(np.diff(knot)) for knot in knots])
+            rng = np.random.default_rng(seed=2026)
+            small_perturbations = rng.normal(loc=0., scale = interval_length/4., size=(len(cell_indices), self.dim))
+        
+        
+        midpoints = np.zeros((len(cell_indices), self.dim), dtype=float)
+        for d in range(self.dim):
+            midpoints[:, d] = 0.5*(knots[d][cell_multi_indices[d]]+knots[d][cell_multi_indices[d]+1])
+        pass
+        return midpoints if not perturbation else midpoints+small_perturbations
+
+    
     def refine_in_rectangle(self, rect, level: int):
         """
         Refines to level+1 all active cells at the specified level that are 

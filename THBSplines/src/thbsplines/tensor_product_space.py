@@ -154,7 +154,7 @@ def numba_cell_to_basis_indices(cell_indices:npt.NDArray[np.int_], cell_to_last_
     offsets = np.arange(-degree, 1, dtype=j.dtype)
     return j[:, None]+offsets[None, :]
 
-from THBSplines.src.pymorton import interleave2, interleave3
+from THBSplines.src.thbsplines.pymorton import interleave2, interleave3
 def quantised_to_morton(quantised_midpoints: npt.NDArray[np.int64])->npt.NDArray[np.int64]:
     dim = quantised_midpoints.shape[1]
     

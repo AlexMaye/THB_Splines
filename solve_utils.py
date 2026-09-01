@@ -1,6 +1,6 @@
 import numpy as np
 from THBSplines.src.cartesian_mesh import CartesianMesh
-from THBSplines.src.hierarchical_space import HierarchicalSpace
+from THBSplines.src.thbsplines.hierarchical_space import HierarchicalSpace
 
 import dolfinx.mesh as dolfinx_mesh
 import dolfinx.fem as dolfinx_fem
