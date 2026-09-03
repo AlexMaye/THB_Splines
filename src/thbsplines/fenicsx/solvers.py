@@ -37,6 +37,7 @@ def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterativ
     if iterative:
         ksp.setType(PETSc.KSP.Type.CG)
         ksp.getPC().setType(PETSc.PC.Type.JACOBI)
+        ksp.setTolerances(rtol=1e-12, atol=1e-12, max_it=2000)
     else:
         ksp.setType(PETSc.KSP.Type.PREONLY)
         ksp.getPC().setType(PETSc.PC.Type.LU)
@@ -45,7 +46,8 @@ def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterativ
     ksp.solve(b, u_sol.x.petsc_vec)
     u_sol.x.scatter_forward()
     u_vec=u_sol.x.array
-
+    print(f"Solve complete. Reason: {ksp.getConvergedReason()}, Iterations: {ksp.getIterationNumber()}")
+    
     ksp.destroy()
     b.destroy()
 
