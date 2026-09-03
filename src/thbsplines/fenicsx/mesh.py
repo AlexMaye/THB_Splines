@@ -31,7 +31,7 @@ class FastMidpointMapper:
         
         return level, self.hs.hmesh.aelem_level[level][local_index]
 
-def build_mesh_2d(hs, mapping= lambda x: x):
+def build_mesh(hs, mapping= lambda x: x, dim3=False):
     """Builds a 2D space and deforms it with the provided mapping. 
     The local multi-level extraction operators are also computed and returned.
     
@@ -42,7 +42,7 @@ def build_mesh_2d(hs, mapping= lambda x: x):
     :returns midpoints: middle points of cells, which is handy to fill the function space when a deformation was passed."""
     total_active_cells = sum(len(hs.hmesh.aelem_level[l]) for l in range(hs.nlevels))
 
-    all_cells = np.empty((4*total_active_cells, 2), dtype=np.float64) # will have coarser cells on top and finer on bottom
+    all_cells = np.empty((2**hs.dim*total_active_cells, hs.dim), dtype=np.float64) # will have coarser cells on top and finer on bottom
     thb_operators: dict[tuple[int, int], npt.NDArray[np.float64]] = {}
     N_max = 0 # maximum amount of dofs in a cell
     current_idx = 0
@@ -51,7 +51,7 @@ def build_mesh_2d(hs, mapping= lambda x: x):
         if len(active_cells_l)==0:
             continue
     
-        thb_operators_list = hs.local_multi_level_extraction_operator2(active_cells_l, l, l)
+        thb_operators_list = hs.local_multi_level_extraction_operator3(active_cells_l, l, l)
         thb_operators.update({(l, cell): op for cell, op in zip(active_cells_l, thb_operators_list)})
         
         if thb_operators_list:
@@ -64,24 +64,37 @@ def build_mesh_2d(hs, mapping= lambda x: x):
         n_cells = len(my_cells_l)
         x_coords = my_cells_l[:, 0, :]
         y_coords = my_cells_l[:, 1, :] 
+        if dim3:
+            z_coords=my_cells_l[:, 2, :]
 
-        start, end = current_idx, current_idx+(4*n_cells)
+        start, end = current_idx, current_idx+(2**hs.dim*n_cells)
 
         view = all_cells[start:end]
-        #points = np.zeros((4 * len(my_cells_l), 2), dtype=np.float64)
-        view[::4] = np.column_stack((x_coords[:, 0], y_coords[:, 0]))  # Bottom-left
-        view[1::4] = np.column_stack((x_coords[:, 1], y_coords[:, 0]))  # Bottom-right
-        view[2::4] = np.column_stack((x_coords[:, 0], y_coords[:, 1]))  # Top-left
-        view[3::4] = np.column_stack((x_coords[:, 1], y_coords[:, 1]))  # Top-right
+        if not dim3:
+            view[::4] = np.column_stack((x_coords[:, 0], y_coords[:, 0]))  # Bottom-left
+            view[1::4] = np.column_stack((x_coords[:, 1], y_coords[:, 0]))  # Bottom-right
+            view[2::4] = np.column_stack((x_coords[:, 0], y_coords[:, 1]))  # Top-left
+            view[3::4] = np.column_stack((x_coords[:, 1], y_coords[:, 1]))  # Top-right
+        else:
+            view[0::8] = np.column_stack((x_coords[:, 0], y_coords[:, 0], z_coords[:, 0]))  # (xmin, ymin, zmin)
+            view[1::8] = np.column_stack((x_coords[:, 1], y_coords[:, 0], z_coords[:, 0]))  # (xmax, ymin, zmin)
+            view[2::8] = np.column_stack((x_coords[:, 0], y_coords[:, 1], z_coords[:, 0]))  # (xmin, ymax, zmin)
+            view[3::8] = np.column_stack((x_coords[:, 1], y_coords[:, 1], z_coords[:, 0]))  # (xmax, ymax, zmin)
+            view[4::8] = np.column_stack((x_coords[:, 0], y_coords[:, 0], z_coords[:, 1]))  # (xmin, ymin, zmax)
+            view[5::8] = np.column_stack((x_coords[:, 1], y_coords[:, 0], z_coords[:, 1]))  # (xmax, ymin, zmax)
+            view[6::8] = np.column_stack((x_coords[:, 0], y_coords[:, 1], z_coords[:, 1]))  # (xmin, ymax, zmax)
+            view[7::8] = np.column_stack((x_coords[:, 1], y_coords[:, 1], z_coords[:, 1]))  # (xmax, ymax, zmax)
 
         current_idx=end
     pass
-    all_cells = np.array(all_cells).reshape(-1, 2)
+    all_cells = np.array(all_cells).reshape(-1, hs.dim)
     all_cells = mapping(all_cells)
 
-    coordinates = np.arange(len(all_cells), dtype=np.int32).reshape(-1, 4)
-    coordinate_element = basix_ufl_element("Q", "quadrilateral", 1, shape=(2,))
+    coordinates = np.arange(len(all_cells), dtype=np.int32).reshape(-1, 2**hs.dim)
+    cell_type = "quadrilateral" if not dim3 else "hexahedron"
+    coordinate_element = basix_ufl_element("Q", cell_type, 1, shape=(hs.dim,))
     disconnected_mesh = dolfinx_mesh.create_mesh(MPI.COMM_WORLD, cells=coordinates, e=coordinate_element, x=all_cells)
     midpoints = np.mean(all_cells.reshape(-1, 4, 2), axis=1)
 
     return disconnected_mesh, thb_operators, N_max, midpoints
+
