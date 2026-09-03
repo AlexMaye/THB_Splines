@@ -174,7 +174,8 @@ class HierarchicalSpace():
         
         self._update_active_functions()
         
-        return T_marked_cells
+        if refine_T_neighbours:
+            return T_marked_cells
         
 
     def _add_level(self, axes=None):
