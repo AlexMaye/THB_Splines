@@ -3,6 +3,57 @@ from petsc4py import PETSc
 import dolfinx.fem as dolfinx_fem
 import numpy as np
 
+def enforce_dirichlet_boundary(hierarchical_space, degree_of_freedom_map: dict[tuple[int, int], int], 
+                        bottom: bool=False, right: bool=False, top: bool=False, left: bool=False):
+    """
+    Identifies Splines indices according to `degree_of_freedom_map` on which 0 Dirichlet boundary conditions should be applied.
+    The location of the Dirichlet boundary condition is specified by setting the according variables to `True`.
+
+    Non-zero Dirichlet boundary conditions, dimensions higher than 2 and «mixed sides» are not yet supported.
+    """
+    dirichlet_indices = {}
+    hs = hierarchical_space
+    dofmap = degree_of_freedom_map
+
+    # Initialise empty arrays so that concatenate does not fail
+    right_dirichlet_indices = np.array([], dtype=bool)
+    left_dirichlet_indices = np.array([], dtype=bool)
+    down_dirichlet_indices = np.array([], dtype=bool)
+    up_dirichlet_indices = np.array([], dtype=bool)
+
+    knotsx = hs.hmesh.one_d_indices[0][0]
+    knotsy = hs.hmesh.one_d_indices[0][1]
+
+    for level in range(hs.nlevels):
+        hs.level_spaces[level].construct_basis()
+        basis = hs.level_spaces[level].basis
+        if right:
+            right_dirichlet_indices = np.isclose(basis[:, 1, -hs.degrees[0]-1:], np.full((hs.degrees[0]+1), fill_value=knotsx[-1], dtype=np.float64))
+            right_dirichlet_indices = np.all(right_dirichlet_indices, axis=-1)
+            right_dirichlet_indices = np.nonzero(right_dirichlet_indices)[0]
+        if left:
+            left_dirichlet_indices = np.isclose(basis[:, 1, :-1], np.full((hs.degrees[0]+1), fill_value=knotsx[0], dtype=np.float64))
+            left_dirichlet_indices = np.all(left_dirichlet_indices, axis=-1)
+            left_dirichlet_indices = np.nonzero(left_dirichlet_indices)[0]
+        if bottom:
+            down_dirichlet_indices = np.isclose(basis[:, 0, :-1], np.full((hs.degrees[0]+1), fill_value=knotsy[0], dtype=np.float64))
+            down_dirichlet_indices = np.all(down_dirichlet_indices, axis=-1)
+            down_dirichlet_indices = np.nonzero(down_dirichlet_indices)[0]
+        if top:
+            up_dirichlet_indices = np.isclose(basis[:, 0, -hs.degrees[0]-1:], np.full((hs.degrees[0]+1), fill_value=knotsy[-1], dtype=np.float64))
+            up_dirichlet_indices = np.all(up_dirichlet_indices, axis=-1)
+            up_dirichlet_indices = np.nonzero(up_dirichlet_indices)[0]
+        
+        all_dirichlet_indices = np.unique(np.concatenate((right_dirichlet_indices, left_dirichlet_indices, up_dirichlet_indices, down_dirichlet_indices)))
+        dirichlet_indices[level] = np.intersect1d(hs.truly_active[level],
+                                                      all_dirichlet_indices,
+                                                      assume_unique=True)
+    pass
+    forbidden_indices = np.array([dofmap[level,idx] for level in dirichlet_indices 
+        for idx in dirichlet_indices[level]], dtype=np.int32)
+    return forbidden_indices
+
+
 def solve_problem(hs, a, rhs, dirichlet_indices, dummy_index, V_spline, iterative=False, return_A=False):
     A = assemble_matrix(a, bcs=[])
     A.assemble()
