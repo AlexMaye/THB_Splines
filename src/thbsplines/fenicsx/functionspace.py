@@ -14,7 +14,7 @@ from basix.ufl import element as basix_ufl_element
 from dolfinx import default_scalar_type
 dtype = default_scalar_type
 
-def build_dofmap(hierarchical_space, mesh, N_max, morton=False):
+def build_dofmap(hierarchical_space, mesh, N_max, morton=False)->dict[tuple[int, int], int]:
     """Builds a degree of freedom map to indicate where each active function
     should be mapped to in the mass/stiffness matrix. 
     
