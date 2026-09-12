@@ -32,10 +32,10 @@ def build_dofmap(hierarchical_space, mesh, N_max, morton=False)->dict[tuple[int,
     disconnected_mesh = mesh
 
     if morton:
-        print("Building dof map with Morton code ordering")
+        # print("Building dof map with Morton code ordering")
         dofmap, dummy_dof_index = hs.build_morton_dof_map()
     else:
-        print("Building dof map with hierarchical ordering.")
+        # print("Building dof map with hierarchical ordering.")
         dofmap, dummy_dof_index = hs.build_global_dof_map()
     dummy_dof_index += 1 
 
