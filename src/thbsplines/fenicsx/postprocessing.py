@@ -41,3 +41,104 @@ def map_spline_to_legendre(hs, V, C_func, N_max, mesh, cells_to_dofs, u_sol, vec
         u_dg.x.array[unrolled_dg_dofs] = u_dg_local
 
     return u_dg
+
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+def convergence_plot(errors_array, n_iterations, degree):
+    if n_iterations<3:
+        print(f"Cannot provide convergence plot for less than 3 iterations ({n_iterations} done).")
+        return
+    
+    errors_array = errors_array[:n_iterations, :]
+    x = errors_array[:, 0]   # degrees of freedom
+    y = errors_array[:, 1]   # error
+
+    fig, ax = plt.subplots()
+    ax.loglog(x, y, linewidth=3, marker='x', markersize=13, mew=3, label=f"Degree {degree}")
+    ax.grid(True, which="both", axis="both", lw=2, alpha=0.6, color="gray", ls="--")
+    ax.set_xlabel("Degrees of freedom")
+    ax.set_ylabel("Approximation error")
+    ax.set_title(f"Error of L2 approximation problem with degree {degree} THB-Splines")
+
+    x_last = x[-min(5, n_iterations):]
+    y_last = y[-min(5, n_iterations):]
+
+    log_x = np.log(x_last)
+    log_y = np.log(y_last)
+
+    slope, intercept = np.polyfit(log_x, log_y, 1)
+
+    # convergence rate
+    rate = -slope
+    x_fit = np.linspace(x_last[0], x_last[-1], 100)
+    y_fit = np.exp(intercept) * x_fit**slope
+
+    ax.loglog(
+        x_fit,
+        y_fit,
+        "--",
+        linewidth=2.5,
+        alpha=0.7,
+        label=f"Fit, rate = {rate:.2f}"
+    )
+
+    # triangle_ax = inset_axes(
+    # ax,
+    # width="25%",
+    # height="25%",
+    # loc="lower left",
+    # bbox_to_anchor=(0.67, 0.05, 1, 1),
+    # bbox_transform=ax.transAxes,
+    # borderpad=0
+    # )
+
+    # # Triangle vertices
+    # x0, y0 = 0, 0
+    # x1, y1 = 1, 0
+    # x2, y2 = 0, rate
+
+    # # Draw the three edges explicitly
+    # triangle_ax.plot(
+    #     [x0, x1], [y0, y1],
+    #     color="purple", linewidth=3
+    # )
+
+    # triangle_ax.plot(
+    #     [x0, x2], [y0, y2],
+    #     color="purple", linewidth=3
+    # )
+
+    # triangle_ax.plot(
+    #     [x1, x2], [y1, y2],
+    #     color="purple", linewidth=3
+    # )
+
+    # # Labels
+    # triangle_ax.text(
+    #     0.5, -0.12,
+    #     "1",
+    #     ha="center",
+    #     va="top",
+    #     fontsize=16,
+    #     fontweight="bold",
+    #     transform=triangle_ax.transAxes
+    # )
+
+    # triangle_ax.text(
+    #     -0.12, rate/2,
+    #     f"{rate:.2f}",
+    #     ha="right",
+    #     va="center",
+    #     fontsize=16,
+    #     fontweight="bold",
+    #     #transform=triangle_ax.transAxes
+    # )
+
+    # # Make it look like a clean annotation
+    # triangle_ax.set_xlim(-0.25, 1.25)
+    # triangle_ax.set_ylim(-0.1, max(rate*1.15, 1))
+    # triangle_ax.set_aspect("equal", adjustable="box")
+    # triangle_ax.axis("off")
+
+    ax.legend()
+    plt.show()
