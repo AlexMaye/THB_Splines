@@ -18,7 +18,7 @@ def dorfler_marking(hierarchical_space: HierarchicalSpace, theta: float,
     num_cells_to_mark = max(2, np.searchsorted(cumulative_errors, threshold_value)+1)
     top_error_indices = descending_indices[:num_cells_to_mark]
     print(f"Total cells marked via Dörfler (theta={theta}): {num_cells_to_mark} out of {len(squared_errors)}")
-    print(f"Indices to refine: {top_error_indices[:10]}")
+    # print(f"Indices to refine: {top_error_indices[:10]}")
     
     my_arr = []
     hs = hierarchical_space
