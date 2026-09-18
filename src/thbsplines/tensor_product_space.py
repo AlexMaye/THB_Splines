@@ -4,8 +4,7 @@ import numpy.typing as npt
 import numpy as np
 import scipy.sparse as sp
 from scipy.interpolate import BSpline, NdBSpline
-#from .cartesian_mesh import CartesianMesh
-from numba import jit
+from numba import jit, njit
 from functools import reduce
 
 @jit(nopython=True)
@@ -166,7 +165,7 @@ def quantised_to_morton(quantised_midpoints: npt.NDArray[np.int64])->npt.NDArray
         raise ValueError(f"Morton encoding not implemented for dim={dim}")
 
 
-@jit(nopython=True)
+@njit
 def compute_nd_cells_numba(start_cells, end_cells, strides, dim):
     num_bases = start_cells.shape[1]
 
@@ -782,7 +781,7 @@ class TensorProductSpace():
         """
         return self.cell_supports[basis_indices]
 
-    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_]) -> list[npt.NDArray[np.int_]]:
+    def basis_to_cell(self, basis_indices: int|list[int]|npt.NDArray[np.int_], flat=False) -> list[npt.NDArray[np.int_]]:
         """
         Returns the indices of cells in the support of the passed basis
         indices. The 'inverse' of cell_to_basis.
@@ -818,8 +817,10 @@ class TensorProductSpace():
             s *= self.mesh_shape[d]
             
         flat_cells, offsets = compute_nd_cells_numba(start_cells, end_cells, strides, self.dim)
-        
-        return [flat_cells[offsets[i]:offsets[i+1]] for i in range(num_bases)]
+        if not flat:
+            return [flat_cells[offsets[i]:offsets[i+1]] for i in range(num_bases)]
+        else:
+            return flat_cells, offsets
         
         # cells_1d = []
         # for d in range(self.dim):
