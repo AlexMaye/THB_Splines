@@ -290,6 +290,31 @@ class HierarchicalMesh():
         self._get_or_create_children(parent_node)
         
         return self.nodes[level][index]
+
+    def _get_level_data(self, level: int):
+        """Precomputes and caches stride and offset data for fast flat-index math."""
+        if not hasattr(self, '_child_cache'):
+            self._child_cache = {}
+            
+        if level not in self._child_cache:
+            c_shape = self.meshes_shape[level - 1]
+            f_shape = self.meshes_shape[level]
+            
+            c_strides = [1] * self.dim
+            f_strides = [1] * self.dim
+            
+            # Standard C-order strides computation
+            for d in range(self.dim - 2, -1, -1):
+                c_strides[d] = c_strides[d+1] * int(c_shape[d+1])
+                f_strides[d] = f_strides[d+1] * int(f_shape[d+1])
+                
+            # Child offsets in flat index space relative to the 0-th child
+            offsets_multi = itertools.product(*(range(2) for _ in range(self.dim)))
+            flat_offsets = [sum(o * s for o, s in zip(off, f_strides)) for off in offsets_multi]
+                
+            self._child_cache[level] = (c_strides, f_strides, flat_offsets)
+            
+        return self._child_cache[level]
     
     def _get_or_create_children(self, parent_node: CellNode):
         """Safely instantiates all 2^dim children of a parent_node upon refinement."""
@@ -300,21 +325,89 @@ class HierarchicalMesh():
         level = parent_node.level + 1
         if level not in self.nodes:
             self.nodes[level] = {}
-            
-        c_shape = self.meshes_shape[parent_node.level]
-        f_shape = self.meshes_shape[level]
-        c_multi = np.unravel_index(parent_node.index, tuple(c_shape))
+
+        # Retrieve precomputed mapping data for this level transition
+        c_strides, f_strides, flat_offsets = self._get_level_data(level)
         
-        # Generate all 2^dim multi-index combinations locally
-        offsets = itertools.product(*(range(2) for _ in range(self.dim)))
-        
-        for offset in offsets:
-            f_multi = tuple(c * 2 + o for c, o in zip(c_multi, offset))
-            f_idx = int(np.ravel_multi_index(f_multi, tuple(f_shape)))
+        # Unravel & map to fine grid in one pass
+        c_base = 0
+        temp = parent_node.index
+        for s_c, s_f in zip(c_strides, f_strides):
+            idx = temp // s_c
+            temp = temp % s_c
+            c_base += 2 * idx * s_f
             
-            child = CellNode(level=level, index=f_idx, parent=parent_node)
-            self.nodes[level][f_idx] = child
-            parent_node.add_child(child)
+        level_nodes = self.nodes[level]
+        
+        # Instantiate children using precomputed flat offsets
+        if self.dim == 2:
+            # Unrolled for maximum performance in 2D
+            f0 = c_base + flat_offsets[0]
+            f1 = c_base + flat_offsets[1]
+            f2 = c_base + flat_offsets[2]
+            f3 = c_base + flat_offsets[3]
+            
+            child0 = CellNode(level=level, index=f0, parent=parent_node)
+            child1 = CellNode(level=level, index=f1, parent=parent_node)
+            child2 = CellNode(level=level, index=f2, parent=parent_node)
+            child3 = CellNode(level=level, index=f3, parent=parent_node)
+            
+            level_nodes[f0] = child0
+            level_nodes[f1] = child1
+            level_nodes[f2] = child2
+            level_nodes[f3] = child3
+            
+            parent_node.children.extend([child0, child1, child2, child3])
+
+        else:
+            # Generic fallback for N-Dimensions
+            new_children = []
+            for offset in flat_offsets:
+                f_idx = c_base + offset
+                child = CellNode(level=level, index=f_idx, parent=parent_node)
+                level_nodes[f_idx] = child
+                new_children.append(child)
+                
+            parent_node.children.extend(new_children)
+            
+        return parent_node.children
+            
+        # c_shape = self.meshes_shape[parent_node.level]
+        # f_shape = self.meshes_shape[level]
+        # c_multi = np.unravel_index(parent_node.index, tuple(c_shape))
+        
+        # # Generate all 2^dim multi-index combinations locally
+        # if self.dim==2:
+        #     #offsets=[(0,0), (0,1), (1,0), (1,1)] 
+        #     offsets = np.array([[0,0], [0,1], [1,0], [1,1]], dtype=int)
+        #     f_multi = offsets + np.array(c_multi).reshape(-1, 2)*2
+        #     f_idx = np.ravel_multi_index((f_multi[:, 0], f_multi[:, 1]), f_shape)
+        #     # Unroll the short loop
+        #     child0= CellNode(level=level, index=f_idx[0], parent=parent_node)
+        #     self.nodes[level][f_idx[0]] = child0
+        #     child1= CellNode(level=level, index=f_idx[1], parent=parent_node)
+        #     self.nodes[level][f_idx[1]] = child1
+        #     child2= CellNode(level=level, index=f_idx[2], parent=parent_node)
+        #     self.nodes[level][f_idx[2]] = child2
+        #     child3= CellNode(level=level, index=f_idx[3], parent=parent_node)
+        #     self.nodes[level][f_idx[3]] = child3
+        #     parent_node.children.extend([child0, child1, child2, child3])
+
+        # else:
+        #     c_shape = self.meshes_shape[parent_node.level]
+        #     f_shape = self.meshes_shape[level]
+        #     c_multi = np.unravel_index(parent_node.index, tuple(c_shape))
+        #     offsets = itertools.product(*(range(2) for _ in range(self.dim)))
+
+            
+        #     for offset in offsets:
+        #         f_multi = tuple(c * 2 + o for c, o in zip(c_multi, offset))
+        #         f_idx = int(np.ravel_multi_index(f_multi, tuple(f_shape)))
+                
+        #         child = CellNode(level=level, index=f_idx, parent=parent_node)
+        #         self.nodes[level][f_idx] = child
+        #         parent_node.add_child(child)
+
 
     def add_level(self):
         """
