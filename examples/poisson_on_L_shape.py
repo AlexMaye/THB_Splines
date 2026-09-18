@@ -95,21 +95,24 @@ def map_uv_to_xy_turn(uv_points, nodes_per_cell=4):
     return xy_cells.reshape(-1, 2)
 
 if __name__=="__main__":
+    print("The first iteration is a bit slow, because the numba code needs to be compiled...")
     n_refinements = 1
     p0 = 3
+    # ==================================================
     # Make sure that the middle knot has a multiplicity of p0
-    knots1 = np.array([0,0,0, 0.5,0.5,0.5, 1,1,1], dtype=np.float64)
-    knots1 = refine(knots1, p=p0, n_times=n_refinements)
-    knots2 = np.array([0,0,0, 0.5,1,1,1], dtype=np.float64)
-    knots2 = refine(knots2, p0, n_times=n_refinements-1)
+    knotsx = np.array([0,0,0, 0.5,0.5,0.5, 1,1,1], dtype=np.float64)
+    #===================================================
+    knotsx = refine(knotsx, p=p0, n_times=n_refinements)
+    knotsy = np.array([0,0,0, 0.5,1,1,1], dtype=np.float64)
+    knotsy = refine(knotsy, p0, n_times=n_refinements-1)
     err_cells = {}
-    hierarchical_space = HierarchicalSpace(knots=[knots1, knots2], degrees=[p0])
+    hierarchical_space = HierarchicalSpace(knots=[knotsx, knotsy], degrees=[p0])
 
     err_cells = {}
     
     # Hyperparameters for the iterative refinement loop
     n_iterations = 0
-    n_max_iterations = 13
+    n_max_iterations = 11
     TOL=1e-7
     current_error=1000.
     errors_array = np.zeros((n_max_iterations, 2), dtype=float)
