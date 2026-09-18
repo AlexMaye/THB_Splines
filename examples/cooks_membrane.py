@@ -16,10 +16,17 @@ from thbsplines.refinement import refine
 from thbsplines.fenicsx.mesh import build_mesh, FastMidpointMapper
 from thbsplines.fenicsx.functionspace import build_dofmap, fill_function_space, create_spline_space
 from thbsplines.fenicsx.solvers import solve_problem_vector_field, enforce_dirichlet_boundary
-from thbsplines.fenicsx.postprocessing import map_spline_to_legendre, convergence_plot
+from thbsplines.fenicsx.postprocessing import map_spline_to_legendre
 from thbsplines.fenicsx.kernels import make_vector_bilinear_kernel, make_vector_linear_kernel
 from thbsplines.fenicsx.adaptivity import dorfler_marking
 from thbsplines.fenicsx.forms import mark_exterior_boundary_entities, mark_cells, exterior_facets, make_bilinear_form, make_linear_form
+
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# This example was inspired by the results on the following webpages
+# https://www.solids4foam.com/tutorials/more-tutorials/solid-mechanics/linearElasticity/cooksMembrane.html
+# https://cofea.readthedocs.io/en/latest/benchmarks/002-cook-membrane/results.html
+# They were last consulted on September 18th, 2026
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
 def mollifier(rho):
             return np.exp(-1./(1.-rho**2))*rho

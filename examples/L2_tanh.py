@@ -20,6 +20,12 @@ from thbsplines.fenicsx.kernels import make_linear_kernel, make_bilinear_kernel
 from thbsplines.fenicsx.postprocessing import map_spline_to_legendre, convergence_plot
 from thbsplines.fenicsx.forms import mark_cells, make_bilinear_form, make_linear_form
 
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# This example was inspired by the paper
+# Adaptive ﬁtting with THB-splines: Error analysis and industrial applications
+# https://doi.org/10.1016/j.cagd.2018.03.026
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
 if __name__=="__main__":
 
     degree = 2 #polynomial degree

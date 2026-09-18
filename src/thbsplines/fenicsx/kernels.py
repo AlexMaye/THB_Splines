@@ -10,6 +10,13 @@ from ffcx.codegeneration.utils import (
     numba_ufcx_kernel_signature as ufcx_signature,
 )
 
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# The implementation is inspired for the DOLFINx tutorial
+# Static condensation of linear elasticity
+# https://docs.fenicsproject.org/dolfinx/main/python/demos/demo_static-condensation.html,
+# last consulted on September 18th, 2026.
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
 def _make_kernel(mesh, ufl_form):
     ufcx, _, _ = ffcx_jit(mesh.comm, ufl_form, form_compiler_options={"scalar_type": dtype})  # type: ignore
     return getattr(ufcx.form_integrals[0], f"tabulate_tensor_{np.dtype(dtype).name}")  # type: ignore
@@ -84,6 +91,12 @@ def make_linear_kernel(mesh, ufl_form, padded_dofs, local_dofs):
 
 @numba.njit(inline="always")
 def _lift_vector_operator(G):
+    """
+    See for example 
+    A first course in finite elements (chapter 9)
+    by Jacob Fish and Ted Belytschko
+    to see why the lifting operation is needed.
+    """
     padded_dofs, local_dofs = G.shape
     G_vec = np.zeros((2*padded_dofs, 2*local_dofs), dtype=G.dtype)
     for i in range(padded_dofs):

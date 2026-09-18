@@ -20,6 +20,12 @@ from thbsplines.fenicsx.kernels import make_linear_kernel, make_bilinear_kernel
 from thbsplines.fenicsx.postprocessing import map_spline_to_legendre, convergence_plot
 from thbsplines.fenicsx.forms import mark_cells, make_bilinear_form, make_linear_form, mark_exterior_boundary_entities, exterior_facets
 
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+# This example reproduces the result of the following paper
+# Multi-level Bézier extraction for hierarchical local refinement of Isogeometric Analysis
+# (https://doi.org/10.1016/j.cma.2017.08.017).
+# = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
 def map_uv_to_xy_turn(uv_points, nodes_per_cell=4):
     """Maps parametric [0,1]^2 to a 4-cell L-shape without polar singularities."""
     # Ensure points are structured as complete cells
