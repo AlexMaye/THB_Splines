@@ -29,6 +29,53 @@ def sorted_isin_2d(ar1_2d, ar2_1d):
                 
     return result_flat.reshape((rows, cols))
 
+@njit
+def augment_basis_to_cell(basis_to_cell_list: list[npt.NDArray])->npt.NDArray:
+    max_length=0
+    for aa in basis_to_cell_list:
+        if len(aa)>max_length:
+            max_length=len(aa)
+    counter = 0
+    extended_array = np.empty((len(basis_to_cell_list), max_length), dtype=np.int32)
+    for element in basis_to_cell_list:
+        extended_array[counter, :len(element)] = element
+        extended_array[counter, len(element):] = element[0]
+        counter = counter+1
+    return extended_array
+
+@njit
+def filter_active_supports(flat_support, offsets, has_active_parent):
+    """Dynamically shrinks the supports array by removing candidates that already have an active parent."""
+    new_size = 0
+    num_bases = len(has_active_parent)
+    for i in range(num_bases):
+        if not has_active_parent[i]:
+            new_size += offsets[i+1] - offsets[i]
+            
+    filtered_support = np.empty(new_size, dtype=flat_support.dtype)
+    new_offsets = np.empty(num_bases + 1, dtype=offsets.dtype)
+    new_offsets[0] = 0
+    
+    current_idx = 0
+    for i in range(num_bases):
+        if not has_active_parent[i]:
+            length = offsets[i+1] - offsets[i]
+            for j in range(length):
+                filtered_support[current_idx + j] = flat_support[offsets[i] + j]
+            current_idx += length
+        new_offsets[i+1] = current_idx
+        
+    return filtered_support, new_offsets
+
+@njit
+def update_active_parents_numba(has_active_parent, active_parents, offsets):
+    """Updates the boolean array indicating if a candidate has an active parent based on offset chunks."""
+    for i in range(len(has_active_parent)):
+        if not has_active_parent[i]:
+            for j in range(offsets[i], offsets[i+1]):
+                if active_parents[j]:
+                    has_active_parent[i] = True
+                    break
 
 class HierarchicalSpace():
     """
@@ -221,58 +268,45 @@ class HierarchicalSpace():
                 # Get all functions that could be truly active
                 candidate_funcs: npt.NDArray[np.int32] = np.unique(space_l.cell_to_basis(active_cells_arr))
                 # And compute their support cells
-                extended_support: list[npt.NDArray[np.int32]] = space_l.basis_to_cell(candidate_funcs)
+                #extended_support: list[npt.NDArray[np.int32]] = space_l.basis_to_cell(candidate_funcs)
+                flat_support, offsets = space_l.basis_to_cell(candidate_funcs, flat=True)
                 has_active_parent = np.zeros_like(candidate_funcs, dtype=bool)
                 
-                # if isinstance(extended_support, list):
-                #     lens = np.fromiter((len(s) for s in extended_support), count=len(extended_support), dtype=np.int32)
-                #     flat_support = np.concatenate(extended_support) if len(extended_support) > 0 else np.array([], dtype=np.int32)
-                # else:
-                #     extended_support = np.asarray(extended_support)
-                #     lens = np.full(extended_support.shape[0], extended_support.shape[1], dtype=np.int32)
-                #     flat_support = extended_support.ravel()
-
-                # # rep_idx maps each cell in flat_support back to its parent candidate_func index
-                # rep_idx = np.repeat(np.arange(len(candidate_funcs), dtype=np.int32), lens)
-                # rep_idx = [0,1,1, 2,2,2, ...]
-                # fine_shape = tuple(self.meshes_shape[l])
-
                 for ll in range(l): # Check on each level if a candidate function is supported on a coarser cell
                     active_cells_up: npt.NDArray[np.int32] = self.hmesh.aelem_level[ll]
-                    if active_cells_up.size==0:
+                    if active_cells_up.size==0 or np.all(has_active_parent):
                         continue # skip the level if there are no active cells at this level
+
+                    filtered_support, filtered_offsets = filter_active_supports(flat_support, offsets, has_active_parent)
                     
-                    # Don't check functions for which an active support cell of a coarser level has already been found
-                    # unresolved_mask = ~has_active_parent 
-                    # if not np.any(unresolved_mask):
-                    #     break # Early stopping: all candidates are already flagged
+                    # 1D mapped array of parents
+                    parents = self.hmesh.get_parent_at_level(
+                        start_level=l, stop_level=ll, marked_cells_at_start_level=filtered_support
+                    )
+                    
+                    # Check which subset maps to true parents
+                    active_parents = sorted_isin(parents, active_cells_up)
+                    
+                    # Fold logic back using offsets
+                    update_active_parents_numba(has_active_parent, active_parents, filtered_offsets)
+                   
+                    # extended_array = augment_basis_to_cell(extended_support)
+                    # extended_shape = extended_array.shape
+                    # parents = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=extended_array.ravel()).reshape(extended_shape)
+                    # active_parents = sorted_isin_2d(parents, active_cells_up)
+                    # has_active_parent = np.logical_or(has_active_parent, np.any(active_parents, axis=1))
 
-                    # # flat_support contains all individual cells that have at least one function supported on them.
-                    # # Therefore, valid_flat_mask filters out the cells that correspond to functions which were already
-                    # # resolved, e.g. we already know that the functions corresponding to those cells have an active parent
-                    # valid_flat_mask = unresolved_mask[rep_idx]
-                    # check_support = flat_support[valid_flat_mask]
-                    # # keeps the arrays synchronised by removing function indices that were already resolved
-                    # check_rep_idx = rep_idx[valid_flat_mask]
-
-                    # parents = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=check_support)
-                    # is_active = sorted_isin(parents, active_cells_up)
-
-                    # if np.any(is_active):
-                    #     has_active_parent[check_rep_idx[is_active]] = True
-
-
-                    for candidate_idx, support in enumerate(extended_support):
-                        if has_active_parent[candidate_idx]:
-                            continue # don't modify the entry if an active parent has already been found
-                        # Get the parents at a coarser level
-                        # If two cells share the same parent, the index of the parent is returned twice
-                        parents: npt.NDArray[np.int32] = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=support)
-                        # Verify which are active
-                        active_parents = sorted_isin(parents, active_cells_up)
-                        # If at least one parent is active, the function is not `truly active`
-                        has_active_parent[candidate_idx] = np.any(active_parents)
-                    pass
+                    # for candidate_idx, support in enumerate(extended_support):
+                    #     if has_active_parent[candidate_idx]:
+                    #         continue # don't modify the entry if an active parent has already been found
+                    #     # Get the parents at a coarser level
+                    #     # If two cells share the same parent, the index of the parent is returned twice
+                    #     parents: npt.NDArray[np.int32] = self.hmesh.get_parent_at_level(start_level=l, stop_level=ll, marked_cells_at_start_level=support)
+                    #     # Verify which are active
+                    #     active_parents = sorted_isin(parents, active_cells_up)
+                    #     # If at least one parent is active, the function is not `truly active`
+                    #     has_active_parent[candidate_idx] = np.any(active_parents)
+                    # pass
                 pass
             else:
                 candidate_funcs = np.array([], dtype=np.int32)
